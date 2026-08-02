@@ -9,16 +9,21 @@ export function Header({ state, connected }: { state: AppState | null; connected
         <div className="logo">
           POLY<span className="accent">SIGNAL</span>
         </div>
-        <div className="tagline">Chainlink-true crypto up/down monitor</div>
+        <div className="tagline">Kalshi crypto markets · CF Benchmarks-true monitor</div>
       </div>
       <div className="spacer" />
       <div className="feedpills">
         {ASSETS.map((a) => {
-          const feed = state?.feeds[a]?.chainlink;
+          const feed = state?.feeds[a]?.index;
           const fresh = feed?.lastTickTs != null && Date.now() - feed.lastTickTs < 6000;
           const cls = feed?.connected && fresh ? "live" : feed?.connected ? "stale" : "";
+          const nSources = feed?.sourcesUp?.length ?? 0;
           return (
-            <div className="pill" key={a} title="Chainlink resolution feed status">
+            <div
+              className="pill"
+              key={a}
+              title={`CF-RTI proxy from: ${feed?.sourcesUp?.join(", ") || "no exchanges"}`}
+            >
               <span className={`dot ${cls}`} />
               <span>{a.toUpperCase()}</span>
               <span className="dim mono">
@@ -26,7 +31,7 @@ export function Header({ state, connected }: { state: AppState | null; connected
                   ? feed.lastPrice.toLocaleString("en-US", { maximumFractionDigits: 2 })
                   : "—"}
               </span>
-              <span className="dim">{feed ? `${feed.ticksPerMin}/min` : ""}</span>
+              <span className="dim">{feed ? `${nSources} exch` : ""}</span>
             </div>
           );
         })}

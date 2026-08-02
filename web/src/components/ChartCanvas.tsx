@@ -59,7 +59,7 @@ export function ChartCanvas({
       <div className="chart-legend">
         <span>
           <span className="legend-swatch" style={{ background: "#f3ba2f" }} />
-          Chainlink (resolution feed)
+          CF-RTI proxy (settlement source)
         </span>
         <span>
           <span className="legend-swatch" style={{ background: "#4f8cff" }} />
@@ -83,7 +83,7 @@ function render(
   windowMs: number,
 ) {
   ctx.clearRect(0, 0, w, h);
-  if (!chart || chart.chainlink.length === 0) {
+  if (!chart || chart.index.length === 0) {
     ctx.fillStyle = "#848e9c";
     ctx.font = "12px sans-serif";
     ctx.fillText("waiting for ticks…", 12, 20);
@@ -91,7 +91,7 @@ function render(
   }
   const now = Date.now();
   const t0 = now - windowMs;
-  const cl = chart.chainlink.filter((t) => t.ts >= t0);
+  const cl = chart.index.filter((t) => t.ts >= t0);
   const bn = chart.binance.filter((t) => t.ts >= t0);
   const prices = [...cl.map((t) => t.price), ...bn.map((t) => t.price)];
   if (session?.strike != null) prices.push(session.strike);
@@ -156,7 +156,7 @@ function render(
     );
   }
 
-  const drawLine = (ticks: ChartData["chainlink"], color: string, width: number, alpha = 1) => {
+  const drawLine = (ticks: ChartData["index"], color: string, width: number, alpha = 1) => {
     if (ticks.length < 2) return;
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = color;

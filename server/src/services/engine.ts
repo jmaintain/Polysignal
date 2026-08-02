@@ -8,8 +8,8 @@ import type {
   LogEntry,
   PriceTick,
   SessionState,
+  SettleWindowState,
   SignalState,
-  StrikeSource,
   TokenBook,
   TradingStatus,
 } from "@polysignal/shared";
@@ -20,7 +20,7 @@ import {
   compositeSignal,
   initBasis,
   initEwmaVar,
-  probUp,
+  probAvgAbove,
   updateBasis,
   updateEwmaVar,
   type BasisState,
@@ -28,14 +28,14 @@ import {
 } from "@polysignal/shared";
 import {
   ASSET_IDS,
-  FEE_RATE,
   HORIZONS,
   HORIZON_IDS,
   TICK_BUFFER_MS,
   VOL_HALF_LIVES,
 } from "../config.js";
-import { ClobMarketFeed } from "../feeds/clob.js";
-import { discoverMarket, slotStartSec } from "./discovery.js";
+import { KalshiBooksFeed } from "../feeds/kalshiBooks.js";
+import { discoverMarket } from "./discovery.js";
+import type { KalshiApi, KalshiCredentials } from "./kalshiApi.js";
 
 interface AssetState {
   ticks: Record<FeedSource, PriceTick[]>;
@@ -48,11 +48,7 @@ interface AssetState {
 interface InternalSession {
   asset: AssetId;
   horizon: HorizonId;
-  slotStart: number | null; // unix sec
   market: SessionState["market"];
-  strike: number | null;
-  strikeSource: StrikeSource;
-  gammaStrike: number | null;
   discoveryError: string | null;
   discovering: boolean;
   lastDirection: string;
@@ -69,19 +65,18 @@ const emptyStatus = (): FeedStatus => ({
 export class Engine {
   private assets = new Map<AssetId, AssetState>();
   private sessions = new Map<string, InternalSession>();
-  private books = new Map<string, TokenBook>();
+  /** market ticker -> side -> book */
+  private books = new Map<string, { up: TokenBook | null; down: TokenBook | null }>();
   private logEntries: LogEntry[] = [];
-  private clob: ClobMarketFeed;
+  private booksFeed: KalshiBooksFeed;
   private discoveryTimer: NodeJS.Timeout | null = null;
   private diagTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private liveCounts: Record<string, number> = {};
   private lastIngestErrorTs = 0;
 
-  /** Hook for the websocket server: called for every accepted price tick. */
   onTick: ((asset: AssetId, source: FeedSource, tick: PriceTick) => void) | null = null;
 
-  /** Supplied by the trading service; defaults to disabled. */
   tradingStatus: () => TradingStatus = () => ({
     enabled: false,
     address: null,
@@ -90,38 +85,41 @@ export class Engine {
     lastError: null,
   });
 
-  constructor() {
+  constructor(
+    private readonly api: KalshiApi,
+    creds: KalshiCredentials | null,
+  ) {
     for (const asset of ASSET_IDS) {
       this.assets.set(asset, {
-        ticks: { chainlink: [], binance: [] },
-        status: { chainlink: emptyStatus(), binance: emptyStatus() },
+        ticks: { index: [], binance: [] },
+        status: { index: emptyStatus(), binance: emptyStatus() },
         vol: VOL_HALF_LIVES.map((halfLifeSec) => ({ halfLifeSec, state: null })),
         basis: initBasis(),
-        latest: { chainlink: null, binance: null },
+        latest: { index: null, binance: null },
       });
       for (const horizon of HORIZON_IDS) {
         this.sessions.set(this.key(asset, horizon), {
           asset,
           horizon,
-          slotStart: null,
           market: null,
-          strike: null,
-          strikeSource: "unknown",
-          gammaStrike: null,
           discoveryError: null,
           discovering: false,
           lastDirection: "NONE",
         });
       }
     }
-    this.clob = new ClobMarketFeed({
-      onBook: (tokenId, book) => this.books.set(tokenId, book),
+    this.booksFeed = new KalshiBooksFeed(api, creds, {
+      onBook: (ticker, side, book) => {
+        const entry = this.books.get(ticker) ?? { up: null, down: null };
+        entry[side] = book;
+        this.books.set(ticker, entry);
+      },
       log: (msg) => this.log("warn", msg),
     });
   }
 
   start(): void {
-    // Kick off discovery for every session, then keep it fresh.
+    this.booksFeed.start();
     for (const session of this.sessions.values()) void this.refreshSession(session);
     this.discoveryTimer = setInterval(() => {
       const now = Date.now();
@@ -134,9 +132,9 @@ export class Engine {
     this.diagTimer = setInterval(() => {
       const parts: string[] = [];
       for (const asset of ASSET_IDS) {
-        const cl = this.liveCounts[`${asset}:chainlink`] ?? 0;
+        const idx = this.liveCounts[`${asset}:index`] ?? 0;
         const bn = this.liveCounts[`${asset}:binance`] ?? 0;
-        parts.push(`${asset} cl:${cl} bn:${bn}`);
+        parts.push(`${asset} idx:${idx} bn:${bn}`);
       }
       this.liveCounts = {};
       this.log("info", `diag live ticks/min — ${parts.join("  ")}`);
@@ -147,30 +145,29 @@ export class Engine {
     this.stopped = true;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     if (this.diagTimer) clearInterval(this.diagTimer);
-    this.clob.stop();
+    this.booksFeed.stop();
   }
 
   // -------------------------------------------------------------------------
   // Feed intake
   // -------------------------------------------------------------------------
 
-  feedStatusChanged(asset: AssetId, source: FeedSource, connected: boolean): void {
-    const a = this.assets.get(asset)!;
-    if (a.status[source].connected !== connected) {
-      this.log(connected ? "info" : "warn", `${asset.toUpperCase()} ${source} feed ${connected ? "connected" : "disconnected"}`);
-    }
-    a.status[source].connected = connected;
+  setIndexSources(asset: AssetId, sourcesUp: string[]): void {
+    const st = this.assets.get(asset)!.status.index;
+    st.sourcesUp = sourcesUp;
+    st.connected = sourcesUp.length > 0;
   }
 
   ingestTick(asset: AssetId, source: FeedSource, tick: PriceTick): void {
     const a = this.assets.get(asset)!;
     const buf = a.ticks[source];
     const last = buf[buf.length - 1];
-    if (last && tick.ts <= last.ts) return; // drop stale/duplicate
+    if (last && tick.ts <= last.ts) return;
     buf.push(tick);
     this.prune(buf);
     a.latest[source] = tick;
     const st = a.status[source];
+    if (source === "binance") st.connected = true;
     st.lastTickTs = tick.ts;
     st.lastPrice = tick.price;
     st.latencyMs = Date.now() - tick.ts;
@@ -178,24 +175,20 @@ export class Engine {
     this.liveCounts[`${asset}:${source}`] = (this.liveCounts[`${asset}:${source}`] ?? 0) + 1;
 
     try {
-      if (source === "chainlink") {
+      if (source === "index") {
         for (const v of a.vol) {
           v.state = v.state
             ? updateEwmaVar(v.state, tick.price, tick.ts, v.halfLifeSec)
             : initEwmaVar(tick.price, tick.ts);
         }
-        this.captureBoundaries(asset, tick);
       }
-
-      // Basis uses near-simultaneous pairs only.
-      const other = a.latest[source === "chainlink" ? "binance" : "chainlink"];
+      const other = a.latest[source === "index" ? "binance" : "index"];
       if (other && Math.abs(other.ts - tick.ts) < 3000) {
-        const cl = source === "chainlink" ? tick.price : other.price;
+        const idx = source === "index" ? tick.price : other.price;
         const bn = source === "binance" ? tick.price : other.price;
-        a.basis = updateBasis(a.basis, cl, bn);
+        a.basis = updateBasis(a.basis, idx, bn);
       }
     } catch (err) {
-      // Never let bookkeeping kill the tick stream; surface it loudly instead.
       if (Date.now() - this.lastIngestErrorTs > 10000) {
         this.lastIngestErrorTs = Date.now();
         this.log("error", `ingest processing error (${asset}/${source}): ${(err as Error).stack ?? err}`);
@@ -203,21 +196,6 @@ export class Engine {
     }
 
     this.onTick?.(asset, source, tick);
-  }
-
-  ingestHistory(asset: AssetId, source: FeedSource, ticks: PriceTick[]): void {
-    const a = this.assets.get(asset)!;
-    const buf = a.ticks[source];
-    const existing = new Set(buf.map((t) => t.ts));
-    for (const t of ticks) {
-      if (!existing.has(t.ts)) buf.push(t);
-    }
-    buf.sort((x, y) => x.ts - y.ts);
-    this.prune(buf);
-    if (source === "chainlink") {
-      this.log("info", `${asset.toUpperCase()} chainlink history dump: ${ticks.length} ticks`);
-      this.recoverStrikesFromHistory(asset);
-    }
   }
 
   private prune(buf: PriceTick[]): void {
@@ -232,72 +210,6 @@ export class Engine {
   }
 
   // -------------------------------------------------------------------------
-  // Strike capture ("price to beat" = Chainlink price at session open)
-  // -------------------------------------------------------------------------
-
-  private captureBoundaries(asset: AssetId, tick: PriceTick): void {
-    const a = this.assets.get(asset)!;
-    for (const horizon of HORIZON_IDS) {
-      const session = this.sessions.get(this.key(asset, horizon))!;
-      const slot = slotStartSec(tick.ts, horizon);
-      if (session.slotStart === slot) continue;
-
-      const boundaryMs = slot * 1000;
-      const prev = this.lastTickAtOrBefore(a.ticks.chainlink, boundaryMs, tick);
-      session.slotStart = slot;
-      if (tick.ts === boundaryMs) {
-        session.strike = tick.price;
-        session.strikeSource = "boundary_tick";
-      } else if (prev && boundaryMs - prev.ts <= 5000) {
-        session.strike = prev.price;
-        session.strikeSource = "boundary_tick";
-      } else if (tick.ts - boundaryMs <= 5000) {
-        // Booted mid-gap: first tick shortly after the boundary.
-        session.strike = tick.price;
-        session.strikeSource = "boundary_tick";
-      } else {
-        session.strike = session.gammaStrike;
-        session.strikeSource = session.gammaStrike != null ? "gamma_field" : "unknown";
-      }
-      if (horizon === "5m" || horizon === "15m") {
-        this.log(
-          "info",
-          `${asset.toUpperCase()} ${horizon} session ${slot}: price to beat ${session.strike?.toFixed(2) ?? "?"} (${session.strikeSource})`,
-        );
-      }
-    }
-  }
-
-  private lastTickAtOrBefore(
-    buf: PriceTick[],
-    tsMs: number,
-    exclude?: PriceTick,
-  ): PriceTick | null {
-    for (let i = buf.length - 1; i >= 0; i--) {
-      const t = buf[i];
-      if (t === exclude) continue;
-      if (t.ts <= tsMs) return t;
-    }
-    return null;
-  }
-
-  private recoverStrikesFromHistory(asset: AssetId): void {
-    const a = this.assets.get(asset)!;
-    for (const horizon of HORIZON_IDS) {
-      const session = this.sessions.get(this.key(asset, horizon))!;
-      if (session.strike !== null && session.strikeSource === "boundary_tick") continue;
-      const slot = session.slotStart ?? slotStartSec(Date.now(), horizon);
-      const boundaryMs = slot * 1000;
-      const prev = this.lastTickAtOrBefore(a.ticks.chainlink, boundaryMs);
-      if (prev && boundaryMs - prev.ts <= 10000) {
-        session.slotStart = slot;
-        session.strike = prev.price;
-        session.strikeSource = "rtds_history";
-      }
-    }
-  }
-
-  // -------------------------------------------------------------------------
   // Market discovery
   // -------------------------------------------------------------------------
 
@@ -305,39 +217,62 @@ export class Engine {
     if (session.discovering || this.stopped) return;
     session.discovering = true;
     try {
-      const now = Date.now();
-      const { info, gammaStrike } = await discoverMarket(session.asset, session.horizon, now);
-      const isNew = session.market?.slug !== info.slug;
+      const spot = this.assets.get(session.asset)!.latest.index?.price ?? null;
+      const { info } = await discoverMarket(
+        this.api,
+        session.asset,
+        session.horizon,
+        Date.now(),
+        spot,
+        (m) => this.log("info", m),
+      );
+      const isNew = session.market?.ticker !== info.ticker;
       session.market = info;
-      session.gammaStrike = gammaStrike;
       session.discoveryError = null;
-      if (session.strike === null && gammaStrike !== null) {
-        session.strike = gammaStrike;
-        session.strikeSource = "gamma_field";
-      }
       if (isNew) {
-        this.log("info", `${session.asset.toUpperCase()} ${session.horizon}: tracking ${info.slug}`);
-        this.updateClobSubscriptions();
+        this.log(
+          "info",
+          `${session.asset.toUpperCase()} ${session.horizon}: tracking ${info.ticker} (strike ${info.strike})`,
+        );
+        this.updateBookSubscriptions();
       }
     } catch (err) {
       session.discoveryError = (err as Error).message;
       if (session.market && Date.now() >= session.market.endTs) {
-        session.market = null; // expired; stop quoting stale odds
-        this.updateClobSubscriptions();
+        session.market = null;
+        this.updateBookSubscriptions();
       }
     } finally {
       session.discovering = false;
     }
   }
 
-  private updateClobSubscriptions(): void {
-    const tokens: string[] = [];
+  private updateBookSubscriptions(): void {
+    const tickers: string[] = [];
     for (const s of this.sessions.values()) {
-      if (s.market && Date.now() < s.market.endTs + 5000) {
-        tokens.push(s.market.upTokenId, s.market.downTokenId);
-      }
+      if (s.market && Date.now() < s.market.endTs + 5000) tickers.push(s.market.ticker);
     }
-    this.clob.setTokens(tokens);
+    this.booksFeed.setTickers(tickers);
+  }
+
+  // -------------------------------------------------------------------------
+  // Settlement window
+  // -------------------------------------------------------------------------
+
+  private settleState(session: InternalSession, a: AssetState): SettleWindowState | null {
+    const market = session.market;
+    if (!market) return null;
+    const now = Date.now();
+    const windowStart = market.endTs - market.settleWindowSec * 1000;
+    if (now < windowStart) return null;
+    const ticks = a.ticks.index.filter((t) => t.ts >= windowStart && t.ts <= market.endTs);
+    const elapsedSec = Math.min((now - windowStart) / 1000, market.settleWindowSec);
+    if (ticks.length === 0) return { elapsedSec, avgSoFar: null, projected: null };
+    const avgSoFar = ticks.reduce((s, t) => s + t.price, 0) / ticks.length;
+    const spot = a.latest.index?.price ?? avgSoFar;
+    const w = market.settleWindowSec;
+    const projected = (avgSoFar * elapsedSec + spot * (w - elapsedSec)) / w;
+    return { elapsedSec, avgSoFar, projected };
   }
 
   // -------------------------------------------------------------------------
@@ -348,15 +283,20 @@ export class Engine {
     return `${asset}:${horizon}`;
   }
 
-  private computeSignal(session: InternalSession, a: AssetState): SignalState | null {
-    const spot = a.latest.chainlink?.price ?? null;
+  private computeSignal(
+    session: InternalSession,
+    a: AssetState,
+    settle: SettleWindowState | null,
+  ): SignalState | null {
+    const spot = a.latest.index?.price ?? null;
     const market = session.market;
     if (spot == null) return null;
 
     const horizonSec = HORIZONS[session.horizon].seconds;
     const secondsLeft = market ? Math.max(0, (market.endTs - Date.now()) / 1000) : null;
-    const up = market ? this.books.get(market.upTokenId) ?? null : null;
-    const down = market ? this.books.get(market.downTokenId) ?? null : null;
+    const entry = market ? this.books.get(market.ticker) : null;
+    const up = entry?.up ?? null;
+    const down = entry?.down ?? null;
 
     const estimators = a.vol
       .filter((v) => v.state !== null)
@@ -365,13 +305,22 @@ export class Engine {
     const sigma = blendSigma(estimators, Math.max(tau, 1));
 
     let p: number | null = null;
-    if (session.strike != null && sigma > 0 && tau > 0) {
-      p = probUp(spot, session.strike, sigma, tau);
+    if (market && sigma > 0 && tau >= 0) {
+      const partial =
+        settle?.avgSoFar != null
+          ? { avgSoFar: settle.avgSoFar, elapsedSec: settle.elapsedSec }
+          : null;
+      const pAbove = probAvgAbove(spot, market.strike, sigma, tau, market.settleWindowSec, partial);
+      p = market.strikeType === "less" ? 1 - pAbove : pAbove;
     }
 
     const bz =
-      a.latest.chainlink && a.latest.binance
-        ? basisZ(a.basis, a.latest.chainlink.price, a.latest.binance.price)
+      a.latest.index && a.latest.binance
+        ? basisZ(a.basis, a.latest.index.price, a.latest.binance.price)
+        : null;
+    const basisPct =
+      a.latest.index && a.latest.binance
+        ? (a.latest.binance.price - a.latest.index.price) / a.latest.index.price
         : null;
 
     if (p == null || market == null || secondsLeft == null) {
@@ -384,10 +333,7 @@ export class Engine {
         sigmaRemaining: sigma > 0 && tau > 0 ? sigma * Math.sqrt(tau) : null,
         annualizedVol: sigma > 0 ? annualizedVol(sigma) : null,
         basisZ: bz,
-        basisPct:
-          a.latest.chainlink && a.latest.binance
-            ? (a.latest.binance.price - a.latest.chainlink.price) / a.latest.chainlink.price
-            : null,
+        basisPct,
         direction: "NONE",
         strength: 0,
         components: [],
@@ -407,28 +353,8 @@ export class Engine {
       downImbalance: down?.imbalance ?? null,
       secondsLeft,
       horizonSec,
-      fee: market.feeSchedule ?? (FEE_RATE > 0 ? { rate: FEE_RATE, exponent: 1 } : null),
+      fee: market.feeSchedule,
     });
-
-    const signal: SignalState = {
-      probUp: p,
-      fairUp: p,
-      fairDown: 1 - p,
-      upBuyEdge: composite.upBuyEdge,
-      downBuyEdge: composite.downBuyEdge,
-      sigmaRemaining: sigma * Math.sqrt(tau),
-      annualizedVol: annualizedVol(sigma),
-      basisZ: bz,
-      basisPct:
-        a.latest.binance && a.latest.chainlink
-          ? (a.latest.binance.price - a.latest.chainlink.price) / a.latest.chainlink.price
-          : null,
-      direction: composite.direction,
-      strength: composite.strength,
-      components: composite.components,
-      kellyFraction: composite.kellyFraction,
-      phase: composite.phase,
-    };
 
     if (
       composite.direction !== session.lastDirection &&
@@ -438,12 +364,27 @@ export class Engine {
       this.log(
         "signal",
         `${session.asset.toUpperCase()} ${session.horizon}: ${composite.direction} ` +
-          `(${composite.strength}) fair ${(p * 100).toFixed(1)}c vs ask ` +
-          `${composite.direction === "UP" ? fmtCents(up?.bestAsk) : fmtCents(down?.bestAsk)}`,
+          `(${composite.strength}) fair ${(p * 100).toFixed(1)}c`,
       );
     }
     session.lastDirection = composite.direction;
-    return signal;
+
+    return {
+      probUp: p,
+      fairUp: p,
+      fairDown: 1 - p,
+      upBuyEdge: composite.upBuyEdge,
+      downBuyEdge: composite.downBuyEdge,
+      sigmaRemaining: sigma * Math.sqrt(Math.max(tau, 0)),
+      annualizedVol: annualizedVol(sigma),
+      basisZ: bz,
+      basisPct,
+      direction: composite.direction,
+      strength: composite.strength,
+      components: composite.components,
+      kellyFraction: composite.kellyFraction,
+      phase: composite.phase,
+    };
   }
 
   sessionStates(): SessionState[] {
@@ -452,21 +393,24 @@ export class Engine {
       const a = this.assets.get(asset)!;
       for (const horizon of HORIZON_IDS) {
         const s = this.sessions.get(this.key(asset, horizon))!;
-        const spot = a.latest.chainlink?.price ?? null;
-        const strike = s.strike;
+        const spot = a.latest.index?.price ?? null;
+        const strike = s.market?.strike ?? null;
+        const entry = s.market ? this.books.get(s.market.ticker) : null;
+        const settle = this.settleState(s, a);
         out.push({
           asset,
           horizon,
           market: s.market,
           strike,
-          strikeSource: s.strikeSource,
+          strikeSource: s.market ? "kalshi_api" : "unknown",
           spot,
           delta: spot != null && strike != null ? spot - strike : null,
           deltaPct: spot != null && strike != null ? (spot - strike) / strike : null,
           secondsLeft: s.market ? Math.max(0, (s.market.endTs - Date.now()) / 1000) : null,
-          up: s.market ? this.books.get(s.market.upTokenId) ?? null : null,
-          down: s.market ? this.books.get(s.market.downTokenId) ?? null : null,
-          signal: this.computeSignal(s, a),
+          up: entry?.up ?? null,
+          down: entry?.down ?? null,
+          settle,
+          signal: this.computeSignal(s, a, settle),
           discoveryError: s.discoveryError,
         });
       }
@@ -478,14 +422,13 @@ export class Engine {
     const feeds = {} as AppState["feeds"];
     for (const asset of ASSET_IDS) {
       const a = this.assets.get(asset)!;
-      // Recompute rolling tick rate even when quiet.
-      for (const src of ["chainlink", "binance"] as FeedSource[]) {
+      for (const src of ["index", "binance"] as FeedSource[]) {
         a.status[src].ticksPerMin = this.countTicksSince(a.ticks[src], Date.now() - 60000);
+        const fresh =
+          a.status[src].lastTickTs != null && Date.now() - a.status[src].lastTickTs! < 10000;
+        if (!fresh) a.status[src].connected = (a.status[src].sourcesUp?.length ?? 0) > 0 && fresh;
       }
-      feeds[asset] = {
-        chainlink: { ...a.status.chainlink },
-        binance: { ...a.status.binance },
-      };
+      feeds[asset] = { index: { ...a.status.index }, binance: { ...a.status.binance } };
     }
     return {
       serverTs: Date.now(),
@@ -500,7 +443,7 @@ export class Engine {
     const a = this.assets.get(asset)!;
     return {
       asset,
-      chainlink: a.ticks.chainlink.slice(-2400),
+      index: a.ticks.index.slice(-2400),
       binance: a.ticks.binance.slice(-2400),
     };
   }
@@ -515,8 +458,4 @@ export class Engine {
     // eslint-disable-next-line no-console
     console.log(`[${new Date().toISOString()}] ${level.toUpperCase()} ${text}`);
   }
-}
-
-function fmtCents(v: number | null | undefined): string {
-  return v == null ? "?" : `${(v * 100).toFixed(1)}c`;
 }

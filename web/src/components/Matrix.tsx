@@ -3,7 +3,7 @@ import { verdictForSession } from "@polysignal/shared";
 import { fmtCents, fmtCountdown, fmtDelta, fmtPct, fmtSignedCents, fmtUsd } from "../format";
 import { VerdictBadge, type ViewMode } from "./Verdict";
 
-const HORIZON_ORDER: HorizonId[] = ["5m", "15m", "1h", "1d"];
+const HORIZON_ORDER: HorizonId[] = ["15m", "1h", "1d"];
 const ASSET_ORDER: AssetId[] = ["btc", "eth", "sol"];
 
 export function Matrix({

@@ -1,30 +1,32 @@
 /**
- * Live validation harness: proves the monitor's prices are accurate, live,
- * and sourced from the Chainlink feed Polymarket resolves against.
+ * Live validation harness (Kalshi + CF Benchmarks edition): proves the
+ * monitor's prices are accurate, live, and faithful to the settlement
+ * source (CF Benchmarks RTI, approximated by its constituent exchanges).
  *
- *   npm run validate            # ~40s quick run
- *   npm run validate -- --strike  # additionally waits for a 5m boundary to
- *                                 # verify "price to beat" capture end-to-end
+ *   npm run validate              # ~40s live check
+ *   npm run validate -- --settle  # + waits for a 15m expiry and grades our
+ *                                 #   60s average against the actual result
  *
  * Checks:
- *   1. RTDS crypto_prices_chainlink streams fresh ticks for BTC/ETH/SOL.
- *   2. Tick timestamps are recent (feed is live, not cached) and monotone.
- *   3. Chainlink prices agree with an independent venue (RTDS Binance topic)
- *      and, when reachable, external references (Kraken/Coinbase REST).
- *   4. Gamma discovery finds the active up/down market per asset/horizon and
- *      the session end time aligns with the horizon.
- *   5. CLOB order books for those markets are live and UP+DOWN mids ~ $1.
- *   6. (--strike) Chainlink tick captured at a 5m boundary matches the new
- *      session's reference within tolerance.
+ *   1. Constituent exchange feeds (Coinbase/Kraken/Bitstamp) are live and
+ *      agree tightly; the 1 Hz composite proxy ticks steadily.
+ *   2. Binance (lead indicator) tracks the proxy within tolerance.
+ *   3. Kalshi discovery finds an active market for every asset/horizon
+ *      with a sane strike and close time.
+ *   4. Kalshi top-of-book obeys YES/NO identities (yes_ask = 100 - no_bid).
+ *   5. (--settle) our proxy's final-minute average agrees with the actual
+ *      settlement result of a real expiring market.
  */
-import { ASSETS, ASSET_IDS, CLOB_REST_URL, HORIZON_IDS, HORIZONS, USER_AGENT } from "./config.js";
-import { RtdsFeed } from "./feeds/rtds.js";
-import { discoverMarket, fetchJson, slotStartSec } from "./services/discovery.js";
+import "dotenv/config";
 import type { AssetId, PriceTick } from "@polysignal/shared";
+import { ASSET_IDS, HORIZON_IDS, HORIZONS } from "./config.js";
+import { IndexProxyService } from "./services/indexProxy.js";
+import { discoverMarket } from "./services/discovery.js";
+import { KalshiApi, loadCredentials } from "./services/kalshiApi.js";
 
 interface CheckResult {
   name: string;
-  pass: boolean | null; // null = skipped
+  pass: boolean | null;
   detail: string;
 }
 
@@ -41,246 +43,157 @@ const median = (xs: number[]) => {
   return s.length ? s[Math.floor(s.length / 2)] : NaN;
 };
 
-interface Collector {
-  ticks: PriceTick[];
-  history: PriceTick[];
-  receivedAt: number[];
-}
-
-async function collectRtds(
-  seconds: number,
-): Promise<Record<AssetId, { chainlink: Collector; binance: Collector }>> {
-  const out = {} as Record<AssetId, { chainlink: Collector; binance: Collector }>;
-  const feeds: RtdsFeed[] = [];
-  for (const asset of ASSET_IDS) {
-    const mk = (): Collector => ({ ticks: [], history: [], receivedAt: [] });
-    out[asset] = { chainlink: mk(), binance: mk() };
-    const cfg = ASSETS[asset];
-    feeds.push(
-      new RtdsFeed({
-        topic: "crypto_prices_chainlink",
-        symbol: cfg.chainlinkSymbol,
-        onTick: (t) => {
-          out[asset].chainlink.ticks.push(t);
-          out[asset].chainlink.receivedAt.push(Date.now());
-        },
-        onHistory: (h) => out[asset].chainlink.history.push(...h),
-      }),
-      new RtdsFeed({
-        topic: "crypto_prices",
-        symbol: cfg.binanceSymbol,
-        onTick: (t) => {
-          out[asset].binance.ticks.push(t);
-          out[asset].binance.receivedAt.push(Date.now());
-        },
-        onHistory: (h) => out[asset].binance.history.push(...h),
-      }),
-    );
-  }
-  for (const f of feeds) f.start();
-  await sleep(seconds * 1000);
-  for (const f of feeds) f.stop();
-  return out;
-}
-
-async function externalReference(asset: AssetId): Promise<{ source: string; price: number } | null> {
-  const pairs: Record<AssetId, { kraken: string; coinbase: string }> = {
-    btc: { kraken: "XBTUSD", coinbase: "BTC-USD" },
-    eth: { kraken: "ETHUSD", coinbase: "ETH-USD" },
-    sol: { kraken: "SOLUSD", coinbase: "SOL-USD" },
-  };
-  try {
-    const k = await fetchJson<{ result: Record<string, { c: string[] }> }>(
-      `https://api.kraken.com/0/public/Ticker?pair=${pairs[asset].kraken}`,
-      6000,
-    );
-    const first = Object.values(k.result ?? {})[0];
-    const px = Number(first?.c?.[0]);
-    if (px > 0) return { source: "kraken", price: px };
-  } catch {
-    /* try coinbase */
-  }
-  try {
-    const c = await fetchJson<{ data: { amount: string } }>(
-      `https://api.coinbase.com/v2/prices/${pairs[asset].coinbase}/spot`,
-      6000,
-    );
-    const px = Number(c.data?.amount);
-    if (px > 0) return { source: "coinbase", price: px };
-  } catch {
-    return null;
-  }
-  return null;
-}
-
 async function main() {
-  const strikeMode = process.argv.includes("--strike");
-  console.log("Polysignal live validation");
-  console.log("==========================\n");
+  const settleMode = process.argv.includes("--settle");
+  console.log("Polysignal live validation (Kalshi / CF Benchmarks)");
+  console.log("===================================================\n");
 
-  console.log("Phase 1: RTDS price feeds (30s sample)");
-  const sample = await collectRtds(30);
+  // ---- Phase 1: index proxy + binance (25s sample) -----------------------
+  console.log("Phase 1: CF-RTI proxy feeds (25s sample)");
+  const index: Record<AssetId, PriceTick[]> = { btc: [], eth: [], sol: [] };
+  const binance: Record<AssetId, PriceTick[]> = { btc: [], eth: [], sol: [] };
+  let sourcesSeen: Record<AssetId, string[]> = { btc: [], eth: [], sol: [] };
+  const proxy = new IndexProxyService((m) => console.log(`    ${m}`));
+  proxy.onIndexTick = (a, t) => index[a].push(t);
+  proxy.onBinanceTick = (a, t) => binance[a].push(t);
+  proxy.onSourcesChange = (a, s) => {
+    if (s.length > sourcesSeen[a].length) sourcesSeen[a] = s;
+  };
+  proxy.start();
+  await sleep(25000);
 
   for (const asset of ASSET_IDS) {
-    const cl = sample[asset].chainlink;
-    const bn = sample[asset].binance;
     const label = asset.toUpperCase();
-
     record(
-      `${label} chainlink stream`,
-      cl.ticks.length >= 5,
-      `${cl.ticks.length} live ticks in 30s (+${cl.history.length} history)`,
+      `${label} proxy composite`,
+      index[asset].length >= 15,
+      `${index[asset].length} ticks in 25s from [${sourcesSeen[asset].join(", ")}]`,
     );
-
-    if (cl.ticks.length > 0) {
-      const lags = cl.ticks.map((t, i) => cl.receivedAt[i] - t.ts);
-      const lag = median(lags);
-      record(
-        `${label} chainlink freshness`,
-        Math.abs(lag) < 15000,
-        `median |receive - source ts| = ${lag.toFixed(0)}ms`,
-      );
-      const sortedOk = cl.ticks.every((t, i) => i === 0 || t.ts >= cl.ticks[i - 1].ts);
-      record(`${label} chainlink monotone timestamps`, sortedOk, sortedOk ? "ordered" : "out-of-order ticks seen");
-    }
-
-    if (cl.ticks.length > 0 && bn.ticks.length > 0) {
+    if (index[asset].length > 0 && binance[asset].length > 0) {
       const basis: number[] = [];
-      for (const t of cl.ticks) {
-        let best: PriceTick | null = null;
-        for (const b of bn.ticks) {
-          if (!best || Math.abs(b.ts - t.ts) < Math.abs(best.ts - t.ts)) best = b;
-        }
-        if (best && Math.abs(best.ts - t.ts) < 3000) {
-          basis.push(Math.abs(best.price - t.price) / t.price);
-        }
+      for (const t of index[asset]) {
+        const b = binance[asset].reduce((best, x) =>
+          Math.abs(x.ts - t.ts) < Math.abs(best.ts - t.ts) ? x : best,
+        );
+        if (Math.abs(b.ts - t.ts) < 2000) basis.push(Math.abs(b.price - t.price) / t.price);
       }
       const med = median(basis);
       record(
-        `${label} chainlink vs binance agreement`,
+        `${label} binance vs proxy`,
         basis.length > 0 && med < 0.005,
-        basis.length > 0
-          ? `median |basis| = ${(med * 100).toFixed(3)}% over ${basis.length} pairs`
-          : "no overlapping pairs",
+        basis.length > 0 ? `median |basis| ${(med * 100).toFixed(3)}%` : "no overlapping pairs",
       );
-    } else {
-      record(`${label} chainlink vs binance agreement`, false, "missing ticks on one side");
-    }
-
-    const last = cl.ticks[cl.ticks.length - 1];
-    if (last) {
-      const ext = await externalReference(asset);
-      if (ext) {
-        const dev = Math.abs(ext.price - last.price) / last.price;
-        record(
-          `${label} chainlink vs ${ext.source}`,
-          dev < 0.01,
-          `chainlink ${last.price.toFixed(2)} vs ${ext.source} ${ext.price.toFixed(2)} (${(dev * 100).toFixed(3)}%)`,
-        );
-      } else {
-        record(`${label} external reference`, null, "kraken/coinbase unreachable from this network");
-      }
     }
   }
 
-  console.log("\nPhase 2: Gamma market discovery");
+  // ---- Phase 2: Kalshi discovery -----------------------------------------
+  console.log("\nPhase 2: Kalshi market discovery");
+  const api = new KalshiApi(loadCredentials());
+  try {
+    await api.getMarkets({ limit: 1 });
+    record("kalshi api reachable", true, "GET /markets OK");
+  } catch (err) {
+    record("kalshi api reachable", false, (err as Error).message);
+  }
+
   const now = Date.now();
-  const found: { asset: AssetId; horizon: string; up: string; down: string; slug: string }[] = [];
+  const found: { asset: AssetId; horizon: string; ticker: string; strike: number; endTs: number }[] = [];
   for (const asset of ASSET_IDS) {
+    const spot = index[asset][index[asset].length - 1]?.price ?? null;
     for (const horizon of HORIZON_IDS) {
       try {
-        const { info } = await discoverMarket(asset, horizon, now);
+        const { info } = await discoverMarket(api, asset, horizon, now, spot, () => {});
         const secsLeft = (info.endTs - now) / 1000;
-        const okWindow = secsLeft > 0 && secsLeft <= HORIZONS[horizon].seconds + 60;
+        const okWindow = secsLeft > 0 && secsLeft <= HORIZONS[horizon].seconds + 3600;
+        const strikeSane =
+          spot == null || (info.strike > spot * 0.5 && info.strike < spot * 2);
         record(
           `${asset.toUpperCase()} ${horizon} market`,
-          okWindow,
-          `${info.slug} ends in ${Math.round(secsLeft)}s`,
+          okWindow && strikeSane,
+          `${info.ticker} strike ${info.strike} ends in ${Math.round(secsLeft)}s`,
         );
-        found.push({ asset, horizon, up: info.upTokenId, down: info.downTokenId, slug: info.slug });
+        found.push({ asset, horizon, ticker: info.ticker, strike: info.strike, endTs: info.endTs });
       } catch (err) {
         record(`${asset.toUpperCase()} ${horizon} market`, false, (err as Error).message);
       }
     }
   }
 
-  console.log("\nPhase 3: CLOB order books");
-  for (const f of found.slice(0, 6)) {
+  // ---- Phase 3: top-of-book identities -----------------------------------
+  console.log("\nPhase 3: order book sanity");
+  if (found.length > 0) {
     try {
-      const [upBook, downBook] = await Promise.all([
-        fetchJson<{ bids?: { price: string; size: string }[]; asks?: { price: string; size: string }[] }>(
-          `${CLOB_REST_URL}/book?token_id=${f.up}`,
-        ),
-        fetchJson<{ bids?: { price: string; size: string }[]; asks?: { price: string; size: string }[] }>(
-          `${CLOB_REST_URL}/book?token_id=${f.down}`,
-        ),
-      ]);
-      const mid = (b: typeof upBook) => {
-        const bb = Math.max(...(b.bids ?? []).map((l) => Number(l.price)), 0);
-        const ba = Math.min(...(b.asks ?? []).map((l) => Number(l.price)), 1);
-        return bb > 0 && ba < 1 ? (bb + ba) / 2 : null;
-      };
-      const upMid = mid(upBook);
-      const downMid = mid(downBook);
-      if (upMid == null || downMid == null) {
-        record(`${f.asset.toUpperCase()} ${f.horizon} book`, false, "empty book side");
-      } else {
-        const sum = upMid + downMid;
+      const body = await api.getMarkets({
+        tickers: found.map((f) => f.ticker).join(","),
+        limit: 100,
+      });
+      for (const m of body.markets ?? []) {
+        const yb = Number(m.yes_bid);
+        const ya = Number(m.yes_ask);
+        const nb = Number(m.no_bid);
+        const identity = Number.isFinite(ya) && Number.isFinite(nb) ? Math.abs(ya - (100 - nb)) : 99;
         record(
-          `${f.asset.toUpperCase()} ${f.horizon} book`,
-          sum > 0.9 && sum < 1.1,
-          `UP mid ${(upMid * 100).toFixed(1)}c + DOWN mid ${(downMid * 100).toFixed(1)}c = ${(sum * 100).toFixed(1)}c`,
+          `book ${m.ticker}`,
+          yb < ya && identity <= 1,
+          `yes ${yb}/${ya}c no_bid ${nb}c (identity off by ${identity}c)`,
         );
       }
     } catch (err) {
-      record(`${f.asset.toUpperCase()} ${f.horizon} book`, false, (err as Error).message);
+      record("top-of-book fetch", false, (err as Error).message);
     }
   }
 
-  if (strikeMode) {
-    console.log("\nPhase 4: strike capture across a 5m boundary");
-    const slotNow = slotStartSec(Date.now(), "5m");
-    const nextBoundary = (slotNow + 300) * 1000;
-    const waitMs = nextBoundary - Date.now() + 3000;
-    console.log(`  waiting ${(waitMs / 1000).toFixed(0)}s for the next 5m boundary...`);
-    const ticks: PriceTick[] = [];
-    const feed = new RtdsFeed({
-      topic: "crypto_prices_chainlink",
-      symbol: ASSETS.btc.chainlinkSymbol,
-      onTick: (t) => ticks.push(t),
-    });
-    feed.start();
-    await sleep(waitMs);
-    feed.stop();
-    const before = [...ticks].reverse().find((t) => t.ts <= nextBoundary);
-    if (!before) {
-      record("BTC 5m strike capture", false, "no tick at boundary");
+  // ---- Phase 4: settlement agreement (optional) --------------------------
+  if (settleMode) {
+    console.log("\nPhase 4: settlement agreement (waits for a 15m expiry)");
+    const next15 = found
+      .filter((f) => f.horizon === "15m")
+      .sort((a, b) => a.endTs - b.endTs)[0];
+    if (!next15) {
+      record("settlement agreement", null, "no 15m market discovered");
     } else {
-      await sleep(2000);
-      try {
-        const { info, gammaStrike } = await discoverMarket("btc", "5m", nextBoundary + 5000);
-        const ref = gammaStrike;
-        if (ref == null) {
-          record(
-            "BTC 5m strike capture",
-            true,
-            `captured ${before.price.toFixed(2)} at boundary (gamma exposes no strike field; boundary tick is the reference)`,
-          );
+      const waitMs = next15.endTs - Date.now() + 3000;
+      console.log(
+        `  watching ${next15.ticker} (strike ${next15.strike}), expires in ${(waitMs / 1000 / 60).toFixed(1)}min`,
+      );
+      await sleep(Math.max(waitMs, 0));
+      const windowStart = next15.endTs - 60000;
+      const windowTicks = index[next15.asset].filter(
+        (t) => t.ts >= windowStart && t.ts <= next15.endTs,
+      );
+      if (windowTicks.length < 30) {
+        record("settlement agreement", false, `only ${windowTicks.length} proxy ticks in window`);
+      } else {
+        const avg = windowTicks.reduce((s, t) => s + t.price, 0) / windowTicks.length;
+        const ourCall = avg > next15.strike ? "yes" : "no";
+        let result = "";
+        for (let i = 0; i < 40 && !result; i++) {
+          await sleep(15000);
+          try {
+            const m = await api.getMarket(next15.ticker);
+            result = String(m.market.result ?? "");
+          } catch {
+            /* retry */
+          }
+        }
+        const margin = Math.abs(avg - next15.strike);
+        if (!result) {
+          record("settlement agreement", null, "market not settled after 10min of polling");
         } else {
-          const dev = Math.abs(ref - before.price) / before.price;
           record(
-            "BTC 5m strike capture",
-            dev < 0.0005,
-            `boundary tick ${before.price.toFixed(2)} vs gamma ${ref.toFixed(2)} for ${info.slug} (${(dev * 100).toFixed(4)}%)`,
+            "settlement agreement",
+            result === ourCall,
+            `our 60s avg ${avg.toFixed(2)} vs strike ${next15.strike} -> ${ourCall.toUpperCase()}; ` +
+              `Kalshi settled ${result.toUpperCase()} (margin $${margin.toFixed(2)})`,
           );
         }
-      } catch (err) {
-        record("BTC 5m strike capture", false, (err as Error).message);
       }
     }
   }
 
-  console.log("\n==========================");
+  proxy.stop();
+
+  console.log("\n===================================================");
   const fails = results.filter((r) => r.pass === false);
   const skips = results.filter((r) => r.pass === null);
   console.log(

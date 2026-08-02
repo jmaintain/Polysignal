@@ -35,7 +35,7 @@ export function FocusPanel({
   }
   const s = session;
   const sig = s.signal;
-  const horizonSec = { "5m": 300, "15m": 900, "1h": 3600, "1d": 86400 }[s.horizon];
+  const horizonSec = { "15m": 900, "1h": 3600, "1d": 86400 }[s.horizon];
   const elapsedFrac =
     s.secondsLeft != null ? Math.min(1, Math.max(0, 1 - s.secondsLeft / horizonSec)) : 0;
   const deltaCls = s.delta == null ? "dim" : s.delta >= 0 ? "pos" : "neg";
@@ -54,7 +54,8 @@ export function FocusPanel({
         <SignalChip s={s} />
       </div>
       <div className="title" style={{ marginTop: 4 }}>
-        {s.market?.question ?? `${s.asset.toUpperCase()} ${s.horizon} — market not found`}
+        {s.market?.title ?? `${s.asset.toUpperCase()} ${s.horizon} — market not found`}
+        {s.market?.yesSubTitle ? ` — ${s.market.yesSubTitle}` : ""}
       </div>
       {s.discoveryError && !s.market && (
         <div className="tradeerr">discovery: {s.discoveryError}</div>
@@ -72,12 +73,12 @@ export function FocusPanel({
         <div className="stat">
           <div className="label">Time left</div>
           <div className="value mono">{fmtCountdown(s.secondsLeft)}</div>
-          <div className="note">{s.market ? s.market.slug : "—"}</div>
+          <div className="note">{s.market ? s.market.ticker : "—"}</div>
         </div>
         <div className="stat">
-          <div className="label">Model P(UP)</div>
+          <div className="label">Model P(YES)</div>
           <div className="value mono gold">{fmtCents(sig?.probUp)}</div>
-          <div className="note">driftless GBM · Φ(d₂)</div>
+          <div className="note">60s-avg settle · Φ(d₂)</div>
         </div>
         <div className="stat">
           <div className="label">σ remaining</div>
@@ -87,7 +88,7 @@ export function FocusPanel({
           </div>
         </div>
         <div className="stat">
-          <div className="label">Basis (BN−CL)</div>
+          <div className="label">Basis (BN−RTI)</div>
           <div className="value mono">{fmtPct(sig?.basisPct, 3)}</div>
           <div className="note">z = {sig?.basisZ != null ? sig.basisZ.toFixed(2) : "—"}</div>
         </div>
@@ -98,18 +99,25 @@ export function FocusPanel({
           </div>
           <div className="note">half-Kelly, 10% cap</div>
         </div>
+        {s.settle && (
+          <div className="stat" style={{ borderColor: "var(--gold)", border: "1px solid" }}>
+            <div className="label">Settle avg ({s.settle.elapsedSec.toFixed(0)}s/60s)</div>
+            <div className="value mono gold">{fmtUsd(s.settle.avgSoFar)}</div>
+            <div className="note">projected {fmtUsd(s.settle.projected)}</div>
+          </div>
+        )}
       </div>
 
       <div className="oddsrow">
         <OddsBox
-          side="UP"
+          side="YES"
           book={s.up}
           fair={sig?.fairUp ?? null}
           edge={sig?.upBuyEdge ?? null}
           fee={feeAtAsk(s, s.up?.bestAsk)}
         />
         <OddsBox
-          side="DOWN"
+          side="NO"
           book={s.down}
           fair={sig?.fairDown ?? null}
           edge={sig?.downBuyEdge ?? null}
@@ -202,7 +210,7 @@ function SimpleFocus({
           </div>
         )}
         <div className="simple-meta dim mono">
-          {s.market?.question ?? "no active market"}
+          {s.market?.title ?? "no active market"}
           {s.secondsLeft != null && <> · ends in {fmtCountdown(s.secondsLeft)}</>}
         </div>
         <button className="linkish" onClick={() => onModeChange("expert")}>
@@ -226,16 +234,18 @@ function OddsBox({
   edge,
   fee,
 }: {
-  side: "UP" | "DOWN";
+  side: "YES" | "NO";
   book: SessionState["up"];
   fair: number | null;
   edge: number | null;
   fee: number | null;
 }) {
-  const cls = side.toLowerCase() as "up" | "down";
+  const cls = side === "YES" ? "up" : "down";
   return (
     <div className={`oddsbox ${cls}`}>
-      <div className={`side ${cls === "up" ? "pos" : "neg"}`}>{side}</div>
+      <div className={`side ${cls === "up" ? "pos" : "neg"}`}>
+        {side} {side === "YES" ? "· above" : "· below"}
+      </div>
       <div className="market mono">{fmtCents(book?.mid)}</div>
       <div className="fair mono">
         bid {fmtCents(book?.bestBid)} / ask {fmtCents(book?.bestAsk)}

@@ -85,13 +85,13 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div className="card">
             <h2>
-              Live market matrix <span className="dim">— Chainlink resolution feed</span>
+              Live market matrix <span className="dim">— CF Benchmarks settlement source</span>
             </h2>
             <Matrix state={state} focus={focus} onFocus={onFocus} mode={mode} />
           </div>
           <div className="card">
             <h2>
-              {focus.asset.toUpperCase()} price — Chainlink vs Binance
+              {focus.asset.toUpperCase()} price — CF-RTI proxy vs Binance
             </h2>
             <ChartCanvas chart={chart} session={focusedSession} />
           </div>
@@ -106,10 +106,12 @@ export default function App() {
         </div>
       </div>
       <div className="footer">
-        Prices stream from Polymarket's Real-Time Data Service topic{" "}
-        <span className="mono">crypto_prices_chainlink</span> — the same Chainlink feed used to
-        resolve these markets. Binance spot is shown only as a leading indicator; it is never used
-        for fair-value pricing against the strike. Signals are informational, not financial advice.
+        Kalshi crypto markets settle on CF Benchmarks' Real-Time Index — the average of its final
+        60 one-second prices. The gold line is a live proxy of that index built from its
+        constituent USD exchanges (Coinbase, Kraken, Bitstamp); run{" "}
+        <span className="mono">npm run validate -- --settle</span> to grade the proxy against an
+        actual settlement. Binance is shown only as a leading indicator. Signals are
+        informational, not financial advice.
       </div>
     </div>
   );

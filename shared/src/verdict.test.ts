@@ -4,7 +4,7 @@ import { classifyVerdict, VERDICT_THRESHOLDS, type VerdictInputs } from "./verdi
 /** A readable, mid-session baseline; tests override what they exercise. */
 const base: VerdictInputs = {
   phase: "TRADEABLE",
-  strikeSource: "boundary_tick",
+  strikeSource: "kalshi_api",
   direction: "NONE",
   strength: 0,
   basisZ: 0,

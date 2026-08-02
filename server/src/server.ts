@@ -30,20 +30,17 @@ export function startServer(engine: Engine, trading: TradingService) {
     const asset = b.asset as AssetId;
     const market = engine.marketFor(asset, b.horizon);
     if (!market) return res.status(400).json({ ok: false, error: "no active market" });
-    const tokenId = b.outcome === "down" ? market.downTokenId : market.upTokenId;
-    const price = Number(b.price);
-    const size = Number(b.size);
-    if (!(price > 0 && price < 1) || !(size > 0)) {
-      return res.status(400).json({ ok: false, error: "invalid price/size" });
+    const priceCents = Number(b.priceCents);
+    const count = Number(b.count);
+    if (!(priceCents >= 1 && priceCents <= 99) || !(count >= 1)) {
+      return res.status(400).json({ ok: false, error: "invalid price/count" });
     }
     const result = await trading.placeOrder({
-      tokenId,
-      side: b.side === "SELL" ? "SELL" : "BUY",
-      price,
-      size,
-      orderKind: b.orderKind === "market" ? "market" : "limit",
-      tickSize: market.tickSize,
-      negRisk: market.negRisk,
+      ticker: market.ticker,
+      side: b.outcome === "down" ? "no" : "yes",
+      action: b.action === "sell" ? "sell" : "buy",
+      priceCents,
+      count,
     });
     res.status(result.ok ? 200 : 502).json(result);
   });
