@@ -35,6 +35,7 @@ export class ClobMarketFeed {
   private books = new Map<string, BookState>();
   private pingTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private applyTimer: NodeJS.Timeout | null = null;
   private closed = false;
   private generation = 0;
 
@@ -52,16 +53,30 @@ export class ClobMarketFeed {
     for (const t of [...this.books.keys()]) {
       if (!tokens.includes(t)) this.books.delete(t);
     }
-    this.reconnect();
-    // Seed with REST snapshots so odds appear before the first WS "book".
-    void this.seedSnapshots(tokens);
+    // Coalesce bursts (all 12 sessions discover within ms of each other at
+    // boot / boundary rollover) into a single reconnect.
+    if (this.applyTimer) clearTimeout(this.applyTimer);
+    this.applyTimer = setTimeout(() => {
+      this.applyTimer = null;
+      this.reconnect();
+      // Seed with REST snapshots so odds appear before the first WS "book".
+      void this.seedSnapshots(this.tokens);
+    }, 300);
   }
 
   stop(): void {
     this.closed = true;
     this.clearTimers();
-    this.ws?.close();
-    this.ws = null;
+    if (this.applyTimer) {
+      clearTimeout(this.applyTimer);
+      this.applyTimer = null;
+    }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.on("error", () => {});
+      this.ws.terminate();
+      this.ws = null;
+    }
   }
 
   private clearTimers(): void {
@@ -78,9 +93,16 @@ export class ClobMarketFeed {
   private reconnect(): void {
     this.generation += 1;
     this.clearTimers();
-    this.ws?.removeAllListeners();
-    this.ws?.close();
+    const old = this.ws;
     this.ws = null;
+    if (old) {
+      old.removeAllListeners();
+      // Closing a socket that is still connecting emits an async error;
+      // swallow it or it becomes an uncaught 'error' event and kills node.
+      old.on("error", () => {});
+      if (old.readyState === WebSocket.CONNECTING) old.terminate();
+      else old.close();
+    }
     if (this.tokens.length > 0 && !this.closed) this.connect(this.generation);
   }
 

@@ -6,6 +6,15 @@ import { TradingService } from "./services/trading.js";
 import { startServer } from "./server.js";
 
 const engine = new Engine();
+
+// A monitor should degrade, not die: log stray async errors (e.g. socket
+// teardown races) and keep streaming.
+process.on("uncaughtException", (err) => {
+  engine.log("error", `uncaught exception: ${err.stack ?? err.message}`);
+});
+process.on("unhandledRejection", (reason) => {
+  engine.log("error", `unhandled rejection: ${String(reason)}`);
+});
 const trading = new TradingService((level, text) => engine.log(level, text));
 engine.tradingStatus = () => trading.getStatus();
 
