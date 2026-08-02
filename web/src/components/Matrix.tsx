@@ -4,7 +4,6 @@ import { fmtCents, fmtCountdown, fmtDelta, fmtPct, fmtSignedCents, fmtUsd } from
 import { VerdictBadge, type ViewMode } from "./Verdict";
 
 const HORIZON_ORDER: HorizonId[] = ["15m", "1h", "1d"];
-const ASSET_ORDER: AssetId[] = ["btc", "eth", "sol"];
 
 export function Matrix({
   state,
@@ -19,7 +18,7 @@ export function Matrix({
 }) {
   if (!state) return <div className="dim">Connecting…</div>;
   const rows: SessionState[] = [];
-  for (const a of ASSET_ORDER) {
+  for (const a of state.assets) {
     for (const h of HORIZON_ORDER) {
       const s = state.sessions.find((x) => x.asset === a && x.horizon === h);
       if (s) rows.push(s);

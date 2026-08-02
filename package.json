@@ -15,7 +15,8 @@
     "test": "npm run test -w shared",
     "validate": "npm run validate -w server --",
     "validate:settle": "npm run validate -w server -- --settle",
-    "probe": "npm run probe -w server"
+    "probe": "npm run probe -w server",
+    "score": "npm run score -w server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

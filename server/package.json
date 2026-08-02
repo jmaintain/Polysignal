@@ -8,7 +8,8 @@
     "start": "tsx src/index.ts",
     "build": "tsc --noEmit",
     "validate": "tsx src/validate.ts",
-    "probe": "tsx src/probe.ts"
+    "probe": "tsx src/probe.ts",
+    "score": "tsx src/score.ts"
   },
   "dependencies": {
     "@polysignal/shared": "1.0.0",

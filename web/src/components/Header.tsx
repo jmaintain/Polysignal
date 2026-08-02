@@ -1,8 +1,7 @@
-import type { AppState, AssetId } from "@polysignal/shared";
-
-const ASSETS: AssetId[] = ["btc", "eth", "sol"];
+import type { AppState } from "@polysignal/shared";
 
 export function Header({ state, connected }: { state: AppState | null; connected: boolean }) {
+  const assets = state?.assets ?? [];
   return (
     <div className="header">
       <div>
@@ -13,7 +12,7 @@ export function Header({ state, connected }: { state: AppState | null; connected
       </div>
       <div className="spacer" />
       <div className="feedpills">
-        {ASSETS.map((a) => {
+        {assets.map((a) => {
           const feed = state?.feeds[a]?.index;
           const fresh = feed?.lastTickTs != null && Date.now() - feed.lastTickTs < 6000;
           const cls = feed?.connected && fresh ? "live" : feed?.connected ? "stale" : "";

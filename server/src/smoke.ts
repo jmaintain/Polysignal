@@ -9,7 +9,7 @@ import { Engine } from "./services/engine.js";
 import { KalshiApi } from "./services/kalshiApi.js";
 import { TradingService } from "./services/trading.js";
 import { startServer } from "./server.js";
-import { SERVER_PORT, SETTLE_WINDOW_SEC } from "./config.js";
+import { ASSET_IDS, HORIZON_IDS, SERVER_PORT, SETTLE_WINDOW_SEC } from "./config.js";
 
 async function main() {
   const api = new KalshiApi(null);
@@ -54,9 +54,14 @@ async function main() {
   const state = engine.appState();
   const btc15 = state.sessions.find((s) => s.asset === "btc" && s.horizon === "15m")!;
 
-  if (!state.feeds.btc.index.connected) failures.push("index feed not marked connected");
-  if ((state.feeds.btc.index.sourcesUp?.length ?? 0) !== 3) failures.push("sourcesUp missing");
-  if (state.feeds.btc.index.ticksPerMin < 30) failures.push(`index tick rate ${state.feeds.btc.index.ticksPerMin}`);
+  const btcFeed = state.feeds.btc?.index;
+  if (!btcFeed) failures.push("btc feed missing from state");
+  else {
+    if (!btcFeed.connected) failures.push("index feed not marked connected");
+    if ((btcFeed.sourcesUp?.length ?? 0) !== 3) failures.push("sourcesUp missing");
+    if (btcFeed.ticksPerMin < 30) failures.push(`index tick rate ${btcFeed.ticksPerMin}`);
+  }
+  if (!state.assets.includes("btc")) failures.push("btc not in state.assets");
   if (btc15.strike !== 63400) failures.push(`strike ${btc15.strike}`);
   if (btc15.strikeSource !== "kalshi_api") failures.push(`strikeSource ${btc15.strikeSource}`);
   if (btc15.settle == null) failures.push("settle window state missing");
@@ -75,7 +80,8 @@ async function main() {
 
   const res = await fetch(`http://localhost:${SERVER_PORT}/api/state`);
   const apiState = await res.json();
-  if (!res.ok || apiState.sessions?.length !== 9) {
+  const expectedSessions = ASSET_IDS.length * HORIZON_IDS.length;
+  if (!res.ok || apiState.sessions?.length !== expectedSessions) {
     failures.push(`/api/state bad response (${res.status}, sessions=${apiState.sessions?.length})`);
   }
   const tradeRes = await fetch(`http://localhost:${SERVER_PORT}/api/trade`, {

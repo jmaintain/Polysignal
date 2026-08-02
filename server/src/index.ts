@@ -1,7 +1,9 @@
 import "dotenv/config";
+import { RECORD_ENABLED } from "./config.js";
 import { Engine } from "./services/engine.js";
 import { IndexProxyService } from "./services/indexProxy.js";
 import { KalshiApi, loadCredentials } from "./services/kalshiApi.js";
+import { Recorder } from "./services/recorder.js";
 import { TradingService } from "./services/trading.js";
 import { startServer } from "./server.js";
 
@@ -36,11 +38,14 @@ engine.log(
 engine.start();
 trading.start();
 proxy.start();
+const recorder = RECORD_ENABLED ? new Recorder(engine, api) : null;
+recorder?.start();
 const server = startServer(engine, trading);
 
 function shutdown() {
   engine.log("info", "shutting down");
   proxy.stop();
+  recorder?.stop();
   trading.stop();
   engine.stop();
   server.close();

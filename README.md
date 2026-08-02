@@ -25,6 +25,19 @@ npm run dev        # server on :8788, dashboard on http://localhost:5173
 
 Monitor-only works with zero configuration (public REST market data). For sub-second full-depth order books and the trading panel, create a free API key on Kalshi (Settings → API keys), save the RSA private key it gives you, and fill in `.env` (see `.env.example`).
 
+## Recording the edge
+
+The dashboard tracks **BTC only** by default — it is the one market with spreads tight enough to trade (1¢ vs 6¢ on SOL). Set `POLYSIGNAL_ASSETS=btc,eth,sol` to widen it.
+
+While the server runs it records the **final 60 seconds of every market** to `data/`: the index price, the settlement average as it builds, the order book, and our model probability — once per second. After each market settles it appends the official CF Benchmarks settlement value and the result.
+
+```bash
+npm run dev     # recording is on by default (RECORD=false to disable)
+npm run score   # after a day or two of recording
+```
+
+`npm run score` answers the only question that matters: **when our projected settlement disagrees with the market price, who is right?** It reports proxy accuracy in bps, how often disagreements of >5/10/20/30 points occur, who won each, hypothetical P&L after Kalshi fees, and a Brier score comparing our forecast to the market's. Under ~100 settled markets, treat it as a hint rather than a result.
+
 ## Validated (live, 2026-08-02)
 
 `npm run validate:settle` against a real expiring market — **24 passed, 0 failed**:

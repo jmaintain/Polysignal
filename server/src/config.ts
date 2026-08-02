@@ -61,8 +61,23 @@ export const HORIZONS: Record<HorizonId, HorizonConfig> = {
   "1d": { id: "1d", seconds: 86400, label: "Daily" },
 };
 
-export const ASSET_IDS = Object.keys(ASSETS) as AssetId[];
+/**
+ * Assets the monitor tracks. BTC only by default — it is the one market
+ * with spreads tight enough to trade (1c vs 6c on SOL). Widen with
+ * POLYSIGNAL_ASSETS=btc,eth,sol.
+ */
+const enabledAssets = (process.env.POLYSIGNAL_ASSETS ?? "btc")
+  .split(",")
+  .map((s) => s.trim().toLowerCase());
+
+export const ASSET_IDS = (Object.keys(ASSETS) as AssetId[]).filter((a) =>
+  enabledAssets.includes(a),
+);
 export const HORIZON_IDS = Object.keys(HORIZONS) as HorizonId[];
+
+/** Final-minute recorder (see services/recorder.ts). */
+export const RECORD_ENABLED = process.env.RECORD !== "false";
+export const RECORD_DIR = process.env.RECORD_DIR ?? "./data";
 
 /**
  * Kalshi series tickers per asset/horizon, verified live via `npm run

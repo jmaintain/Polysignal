@@ -483,6 +483,7 @@ export class Engine {
     }
     return {
       serverTs: Date.now(),
+      assets: [...ASSET_IDS],
       feeds,
       sessions: this.sessionStates(),
       trading: this.tradingStatus(),

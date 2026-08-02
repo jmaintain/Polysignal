@@ -169,7 +169,9 @@ export interface TradingStatus {
 
 export interface AppState {
   serverTs: number;
-  feeds: Record<AssetId, Record<FeedSource, FeedStatus>>;
+  /** Assets this server is tracking, in display order. */
+  assets: AssetId[];
+  feeds: Partial<Record<AssetId, Record<FeedSource, FeedStatus>>>;
   sessions: SessionState[];
   trading: TradingStatus;
   log: LogEntry[];
