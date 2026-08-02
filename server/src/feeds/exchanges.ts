@@ -29,6 +29,8 @@ abstract class BaseFeed {
   protected abstract url(): string;
   protected abstract onOpen(ws: WebSocket): void;
   protected abstract onMessage(text: string): void;
+  /** Hook invoked before each reconnect attempt (e.g. to rotate hosts). */
+  protected beforeReconnect(): void {}
 
   start(): void {
     this.closed = false;
@@ -63,6 +65,7 @@ abstract class BaseFeed {
     ws.on("ping", () => ws.pong());
     const down = () => {
       if (this.closed) return;
+      this.beforeReconnect();
       const delay = this.reconnectDelay;
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, 20000);
       this.log(`[${this.name}] disconnected, retrying in ${delay}ms`);
@@ -169,20 +172,37 @@ export class BitstampFeed extends BaseFeed {
 /**
  * Binance lead-indicator feed (not an RTI constituent, which is what makes
  * it an orthogonal signal). Combined bookTicker stream, one connection.
+ *
+ * binance.com geo-blocks US clients with HTTP 451, so the feed rotates to
+ * binance.us (identical protocol and symbols) until a host actually
+ * connects, then locks onto it.
  */
 export class BinanceFeed extends BaseFeed {
   readonly name = "binance";
+  private static readonly HOSTS = ["stream.binance.com:9443", "stream.binance.us:9443"];
+  private hostIndex = 0;
+  private hostLocked = false;
   private symbols = new Map<string, AssetId>(
     ASSET_IDS.map((a) => [ASSETS[a].binanceSymbol.toUpperCase(), a]),
   );
 
   protected url(): string {
     const streams = ASSET_IDS.map((a) => `${ASSETS[a].binanceSymbol}@bookTicker`).join("/");
-    return `wss://stream.binance.com:9443/stream?streams=${streams}`;
+    return `wss://${BinanceFeed.HOSTS[this.hostIndex]}/stream?streams=${streams}`;
   }
 
   protected onOpen(): void {
     /* combined streams need no subscribe message */
+    if (!this.hostLocked) {
+      this.hostLocked = true;
+      this.log(`[binance] connected via ${BinanceFeed.HOSTS[this.hostIndex]}`);
+    }
+  }
+
+  protected beforeReconnect(): void {
+    if (!this.hostLocked) {
+      this.hostIndex = (this.hostIndex + 1) % BinanceFeed.HOSTS.length;
+    }
   }
 
   protected onMessage(text: string): void {
