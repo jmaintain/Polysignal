@@ -1,0 +1,24 @@
+{
+  "name": "polysignal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time Polymarket crypto up/down market monitor driven by the Chainlink resolution price feed, with quantitative fair-value signals and optional manual trading.",
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "build": "npm run build -w web && npm run build -w server",
+    "start": "npm run start -w server",
+    "test": "npm run test -w shared",
+    "validate": "npm run validate -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
