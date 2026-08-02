@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { AssetId, HorizonId, SessionState } from "@polysignal/shared";
+import { verdictForSession, type Verdict } from "@polysignal/shared";
 import { useLiveData } from "./ws";
 import type { ViewMode } from "./components/Verdict";
 import { Header } from "./components/Header";
@@ -37,8 +38,48 @@ export default function App() {
     setFocusAsset(asset);
   };
 
+  // Threshold alerts: banner only on the *transition* into STRONG per
+  // market (debounced by tracking the previous verdict per session key).
+  const [banners, setBanners] = useState<{ id: number; text: string }[]>([]);
+  const prevVerdicts = useRef<Record<string, Verdict>>({});
+  const bannerId = useRef(0);
+  useEffect(() => {
+    if (!state) return;
+    for (const s of state.sessions) {
+      const key = `${s.asset}:${s.horizon}`;
+      const v = verdictForSession(s).verdict;
+      const prev = prevVerdicts.current[key];
+      prevVerdicts.current[key] = v;
+      // prev === undefined is first sight (page load) — not a transition.
+      if (v === "STRONG" && prev !== undefined && prev !== "STRONG") {
+        const id = ++bannerId.current;
+        const dir = verdictForSession(s).direction;
+        setBanners((b) => [
+          ...b,
+          { id, text: `🟢 Strong signal on ${s.asset.toUpperCase()} ${s.horizon}${dir ? ` — ${dir}` : ""}` },
+        ]);
+        setTimeout(() => setBanners((b) => b.filter((x) => x.id !== id)), 8000);
+      }
+    }
+  }, [state]);
+
   return (
     <div className="app">
+      {banners.length > 0 && (
+        <div className="banners">
+          {banners.map((b) => (
+            <div className="banner" key={b.id}>
+              <span>{b.text}</span>
+              <button
+                className="dismiss"
+                onClick={() => setBanners((xs) => xs.filter((x) => x.id !== b.id))}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <Header state={state} connected={connected} />
       <div className="grid">
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
