@@ -13,6 +13,7 @@ import {
   kellyFraction,
   microprice,
   normCdf,
+  probAvgAbove,
   probUp,
   sigmaPerSqrtSec,
   takerFeePerShare,
@@ -86,6 +87,66 @@ describe("probUp", () => {
   it("handles zero sigma deterministically", () => {
     expect(probUp(101, 100, 0, 900)).toBe(1);
     expect(probUp(99, 100, 0, 900)).toBe(0);
+  });
+});
+
+describe("probAvgAbove (60s-average settlement, CF Benchmarks rule)", () => {
+  const sigma = 0.0002;
+
+  it("outside the window it prices with tauEff = (tau - w) + w/3", () => {
+    const direct = probAvgAbove(100050, 100000, sigma, 900, 60);
+    const equivalent = probUp(100050, 100000, sigma, 840 + 20);
+    expect(direct).toBeCloseTo(equivalent, 12);
+  });
+
+  it("average settlement is sharper than point settlement near expiry", () => {
+    // At tau = 70s, only ~10s of open drift plus a damped window remain.
+    const avg = probAvgAbove(100050, 100000, sigma, 70, 60);
+    const point = probUp(100050, 100000, sigma, 70);
+    expect(avg).toBeGreaterThan(point);
+  });
+
+  it("is monotonic in spot", () => {
+    const lo = probAvgAbove(99950, 100000, sigma, 300, 60);
+    const hi = probAvgAbove(100050, 100000, sigma, 300, 60);
+    expect(hi).toBeGreaterThan(lo);
+  });
+
+  it("pins to 1 when the observed average has banked the strike", () => {
+    // 50s observed averaging $100,200 vs strike $100,000: even a crash to
+    // zero over the last 10s cannot pull the mean below the strike
+    // (50*100200/60 = 83,500 > 60*100000/60? -> kAdj <= 0 when
+    // w*K - e*avgObs <= 0: 6,000,000 - 5,010,000 > 0, so use a bigger lead).
+    const banked = probAvgAbove(100200, 100000, sigma, 10, 60, {
+      avgSoFar: 120100,
+      elapsedSec: 50,
+    });
+    expect(banked).toBe(1);
+  });
+
+  it("inside the window, a strong observed average dominates a spot dip", () => {
+    // Spot dipped just below the strike, but 50 of 60 seconds averaged well
+    // above it — the settlement average is still overwhelmingly likely to
+    // finish above.
+    const p = probAvgAbove(99990, 100000, sigma, 10, 60, {
+      avgSoFar: 100100,
+      elapsedSec: 50,
+    });
+    expect(p).toBeGreaterThan(0.95);
+    // Whereas a point-settlement model would call this a loser.
+    expect(probUp(99990, 100000, sigma, 10)).toBeLessThan(0.5);
+  });
+
+  it("degenerates to the indicator on the observed average at expiry", () => {
+    expect(probAvgAbove(99000, 100000, sigma, 0, 60, { avgSoFar: 100010, elapsedSec: 60 })).toBe(1);
+    expect(probAvgAbove(101000, 100000, sigma, 0, 60, { avgSoFar: 99990, elapsedSec: 60 })).toBe(0);
+  });
+
+  it("falls back to point pricing when the window is zero", () => {
+    expect(probAvgAbove(100050, 100000, sigma, 300, 0)).toBeCloseTo(
+      probUp(100050, 100000, sigma, 300),
+      12,
+    );
   });
 });
 
@@ -189,10 +250,10 @@ describe("edges and sizing", () => {
     expect(buyEdge(0.4, 0.5)).toBeCloseTo(-0.1, 9);
   });
 
-  it("crypto_fees_v2 taker fee = rate * min(p, 1-p)", () => {
-    expect(takerFeePerShare(0.115, 0.07)).toBeCloseTo(0.07 * 0.115, 9);
-    expect(takerFeePerShare(0.9, 0.07)).toBeCloseTo(0.07 * 0.1, 9);
-    expect(takerFeePerShare(0.5, 0.07, 2)).toBeCloseTo(0.07 * 0.25, 9);
+  it("Kalshi taker fee = rate * p * (1-p)", () => {
+    expect(takerFeePerShare(0.115, 0.07)).toBeCloseTo(0.07 * 0.115 * 0.885, 9);
+    expect(takerFeePerShare(0.5, 0.07)).toBeCloseTo(0.07 * 0.25, 9);
+    expect(takerFeePerShare(0.9, 0.07)).toBeCloseTo(0.07 * 0.09, 9);
     expect(takerFeePerShare(0.5, 0)).toBe(0);
   });
 
@@ -280,10 +341,11 @@ describe("compositeSignal", () => {
   });
 
   it("taker fees shrink the edge and can kill a marginal signal", () => {
-    const noFee = compositeSignal({ ...base, probUp: 0.54 });
-    const withFee = compositeSignal({ ...base, probUp: 0.54, fee: { rate: 0.07, exponent: 1 } });
-    expect(noFee.upBuyEdge!).toBeCloseTo(0.04, 9);
-    expect(withFee.upBuyEdge!).toBeCloseTo(0.04 - 0.07 * 0.5, 9);
+    const noFee = compositeSignal({ ...base, probUp: 0.525 });
+    const withFee = compositeSignal({ ...base, probUp: 0.525, fee: { rate: 0.07, exponent: 1 } });
+    expect(noFee.upBuyEdge!).toBeCloseTo(0.025, 9);
+    // Kalshi fee at 50c: 0.07 * 0.5 * 0.5 = 1.75c off the edge.
+    expect(withFee.upBuyEdge!).toBeCloseTo(0.025 - 0.0175, 9);
     expect(noFee.direction).toBe("UP");
     expect(withFee.direction).toBe("NONE");
   });

@@ -160,6 +160,66 @@ export function probUp(
   return normCdf(d2);
 }
 
+/** Partially observed settlement window (the final `elapsedSec` seconds). */
+export interface PartialAverage {
+  /** Mean of the index prices observed so far inside the window. */
+  avgSoFar: number;
+  /** Seconds of the window already observed (0..window). */
+  elapsedSec: number;
+}
+
+/**
+ * Probability that the **time-average** of the price over the final
+ * `avgWindowSec` seconds ends above `strike` — the CF Benchmarks settlement
+ * rule (e.g. Kalshi crypto markets: mean of the 60 one-second RTI prices
+ * before expiry).
+ *
+ * Outside the window (tau > w): the average of a driftless GBM over the
+ * final w seconds is approximately lognormal with variance
+ * sigma^2 * ((tau - w) + w/3), so we price with that effective tau. The
+ * w/3 term is the classic variance of a Brownian time-average.
+ *
+ * Inside the window (tau <= w): settlement is
+ *   X = (e * avgObserved + tau * avgFuture) / w,   e = w - tau observed,
+ * so X > K  <=>  avgFuture > K' = (w*K - e*avgObserved) / tau, and the
+ * future short-window average has variance ~ sigma^2 * tau/3. When the
+ * observed average has already banked enough, K' drops to/below zero and
+ * the probability pins to 1 (a "locked by the average" market) — this is
+ * exactly the regime where these markets misprice most.
+ */
+export function probAvgAbove(
+  spot: number,
+  strike: number,
+  sigmaSqrtSec: number,
+  tauSec: number,
+  avgWindowSec = 60,
+  partial: PartialAverage | null = null,
+): number {
+  if (!(spot > 0) || !(strike > 0)) return NaN;
+  const w = avgWindowSec;
+  if (!(w > 0)) return probUp(spot, strike, sigmaSqrtSec, tauSec);
+
+  if (tauSec >= w) {
+    const tauEff = (tauSec - w) + w / 3;
+    return probUp(spot, strike, sigmaSqrtSec, tauEff);
+  }
+
+  const tau = Math.max(tauSec, 0);
+  const elapsed = Math.min(Math.max(partial?.elapsedSec ?? w - tau, 0), w);
+  // Without observed data, the best estimate of the observed leg is spot.
+  const avgObs = partial?.avgSoFar ?? spot;
+
+  if (tau <= 0.001) {
+    return avgObs > strike ? 1 : avgObs < strike ? 0 : 0.5;
+  }
+
+  // The future leg carries weight (w - elapsed) of the window average.
+  const futureSec = Math.max(w - elapsed, 0.001);
+  const kAdj = (w * strike - elapsed * avgObs) / futureSec;
+  if (kAdj <= 0) return 1; // average already banked above the strike
+  return probUp(spot, kAdj, sigmaSqrtSec, futureSec / 3);
+}
+
 /**
  * Sensitivity of the UP probability to a $1 move in spot (binary delta):
  * dP/dS = phi(d2) / (S sigma sqrt(tau)).
@@ -190,12 +250,14 @@ export function breakevenMove(spot: number, strike: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Polymarket crypto_fees_v2 taker fee per share at a given price:
- * fee = rate * min(p, 1-p)^exponent. (7% of the cheaper side at rate=0.07.)
+ * Kalshi taker fee per contract at a given price (in dollars, 0..1):
+ * fee = rate * (price * (1 - price))^exponent — Kalshi's published formula
+ * with rate 0.07 and exponent 1. (The exchange rounds the total up to the
+ * next cent per order; per-share sizing uses the unrounded value.)
  */
 export function takerFeePerShare(price: number, rate: number, exponent = 1): number {
   if (!(price > 0) || price >= 1 || !(rate > 0)) return 0;
-  return rate * Math.pow(Math.min(price, 1 - price), exponent);
+  return rate * Math.pow(price * (1 - price), exponent);
 }
 
 /**
