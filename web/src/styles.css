@@ -191,3 +191,51 @@ input.field, select.field {
 .log .trade { color: var(--blue); }
 
 .footer { margin-top: 16px; color: var(--text-dim); font-size: 11px; line-height: 1.6; }
+
+/* Simple Mode */
+.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.panel-head h2 { margin-bottom: 10px; }
+
+.mode-toggle { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.mode-toggle .btn { border: none; border-radius: 0; padding: 4px 12px; font-size: 11px; background: transparent; color: var(--text-dim); }
+.mode-toggle .btn.active { background: var(--card2); color: var(--gold); }
+
+.simple-focus { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+
+.verdict-badge { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; }
+.verdict-badge .emoji { line-height: 1; }
+.verdict-badge.big { font-size: 20px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card2); }
+.verdict-badge.big.strong { border-color: rgba(0, 192, 118, 0.5); color: var(--green); }
+.verdict-badge.big.weak { border-color: rgba(243, 186, 47, 0.5); color: var(--gold); }
+.verdict-badge.big.no_read { color: var(--text-dim); }
+
+.simple-sentence { margin: 0; font-size: 15px; line-height: 1.55; max-width: 46ch; }
+
+.confidence { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.confidence .dial { display: flex; gap: 3px; }
+.confidence .seg { width: 26px; height: 8px; border-radius: 3px; background: var(--border); }
+.confidence .seg.on.l1 { background: var(--text-dim); }
+.confidence .seg.on.l2 { background: var(--gold); }
+.confidence .seg.on.l3 { background: var(--green); }
+.conf-label { font-weight: 600; text-transform: capitalize; }
+.conf-label.low { color: var(--text-dim); }
+.conf-label.medium { color: var(--gold); }
+.conf-label.high { color: var(--green); }
+
+.why { width: 100%; }
+.why-toggle { background: none; border: none; color: var(--text); cursor: pointer; font-size: 13px; font-weight: 600; padding: 0; }
+.why-toggle:hover { color: var(--gold); }
+.why-list { margin: 8px 0 0; padding-left: 18px; font-size: 13px; line-height: 1.6; color: var(--text-dim); }
+
+.simple-meta { font-size: 11px; }
+.linkish { background: none; border: none; color: var(--text-dim); text-decoration: underline; cursor: pointer; font-size: 11px; padding: 0; }
+.linkish:hover { color: var(--gold); }
+
+/* Threshold alert banners */
+.banners { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 50; display: flex; flex-direction: column; gap: 6px; }
+.banner {
+  background: var(--card); border: 1px solid rgba(0, 192, 118, 0.6);
+  color: var(--text); border-radius: 8px; padding: 8px 14px; font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5); display: flex; gap: 10px; align-items: center;
+}
+.banner .dismiss { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 13px; padding: 0; }

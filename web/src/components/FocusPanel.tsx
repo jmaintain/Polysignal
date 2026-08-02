@@ -1,16 +1,37 @@
+import { useState } from "react";
 import type { SessionState } from "@polysignal/shared";
-import { takerFeePerShare } from "@polysignal/shared";
+import {
+  SIMPLE_COPY,
+  sentenceForSession,
+  takerFeePerShare,
+  verdictForSession,
+} from "@polysignal/shared";
 import { fmtCents, fmtCountdown, fmtDelta, fmtPct, fmtSignedCents, fmtUsd } from "../format";
 import { SignalChip } from "./Matrix";
+import { ConfidenceDial, ModeToggle, VerdictBadge, type ViewMode } from "./Verdict";
 
-export function FocusPanel({ session }: { session: SessionState | null }) {
+export function FocusPanel({
+  session,
+  mode,
+  onModeChange,
+}: {
+  session: SessionState | null;
+  mode: ViewMode;
+  onModeChange: (mode: ViewMode) => void;
+}) {
   if (!session) {
     return (
       <div className="card">
-        <h2>Focused market</h2>
+        <div className="panel-head">
+          <h2>Focused market</h2>
+          <ModeToggle mode={mode} onChange={onModeChange} />
+        </div>
         <div className="dim">Waiting for data…</div>
       </div>
     );
+  }
+  if (mode === "simple") {
+    return <SimpleFocus s={session} mode={mode} onModeChange={onModeChange} />;
   }
   const s = session;
   const sig = s.signal;
@@ -21,7 +42,10 @@ export function FocusPanel({ session }: { session: SessionState | null }) {
 
   return (
     <div className="card">
-      <h2>Focused market</h2>
+      <div className="panel-head">
+        <h2>Focused market</h2>
+        <ModeToggle mode={mode} onChange={onModeChange} />
+      </div>
       <div className="focus-head">
         <span className="big mono">{fmtUsd(s.spot)}</span>
         <span className={`mono ${deltaCls}`} style={{ fontSize: 18 }}>
@@ -129,6 +153,62 @@ export function FocusPanel({ session }: { session: SessionState | null }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function SimpleFocus({
+  s,
+  mode,
+  onModeChange,
+}: {
+  s: SessionState;
+  mode: ViewMode;
+  onModeChange: (mode: ViewMode) => void;
+}) {
+  const [whyOpen, setWhyOpen] = useState(false);
+  const verdict = verdictForSession(s);
+  const sentence = sentenceForSession(s, verdict);
+  const components = s.signal?.components ?? [];
+
+  return (
+    <div className="card">
+      <div className="panel-head">
+        <h2>
+          {s.asset.toUpperCase()} {s.horizon} market
+        </h2>
+        <ModeToggle mode={mode} onChange={onModeChange} />
+      </div>
+      <div className="simple-focus">
+        <VerdictBadge v={verdict} big />
+        <p className="simple-sentence">{sentence}</p>
+        {verdict.verdict !== "NO_READ" && <ConfidenceDial confidence={verdict.confidence} />}
+        {components.length > 0 && (
+          <div className="why">
+            <button className="why-toggle" onClick={() => setWhyOpen(!whyOpen)}>
+              {whyOpen ? "▾" : "▸"} Why?
+            </button>
+            {whyOpen && (
+              <ul className="why-list">
+                {components.map((c) => {
+                  const phrase =
+                    c.id in SIMPLE_COPY.components
+                      ? SIMPLE_COPY.components[c.id as keyof typeof SIMPLE_COPY.components](c.score)
+                      : `${c.label}: ${c.detail}`;
+                  return <li key={c.id}>{phrase}</li>;
+                })}
+              </ul>
+            )}
+          </div>
+        )}
+        <div className="simple-meta dim mono">
+          {s.market?.question ?? "no active market"}
+          {s.secondsLeft != null && <> · ends in {fmtCountdown(s.secondsLeft)}</>}
+        </div>
+        <button className="linkish" onClick={() => onModeChange("expert")}>
+          switch to expert view
+        </button>
+      </div>
     </div>
   );
 }

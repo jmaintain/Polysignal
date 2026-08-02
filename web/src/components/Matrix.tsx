@@ -1,5 +1,7 @@
 import type { AppState, AssetId, HorizonId, SessionState } from "@polysignal/shared";
+import { verdictForSession } from "@polysignal/shared";
 import { fmtCents, fmtCountdown, fmtDelta, fmtPct, fmtSignedCents, fmtUsd } from "../format";
+import { VerdictBadge, type ViewMode } from "./Verdict";
 
 const HORIZON_ORDER: HorizonId[] = ["5m", "15m", "1h", "1d"];
 const ASSET_ORDER: AssetId[] = ["btc", "eth", "sol"];
@@ -8,10 +10,12 @@ export function Matrix({
   state,
   focus,
   onFocus,
+  mode,
 }: {
   state: AppState | null;
   focus: { asset: AssetId; horizon: HorizonId };
   onFocus: (asset: AssetId, horizon: HorizonId) => void;
+  mode: ViewMode;
 }) {
   if (!state) return <div className="dim">Connecting…</div>;
   const rows: SessionState[] = [];
@@ -21,6 +25,7 @@ export function Matrix({
       if (s) rows.push(s);
     }
   }
+  const simple = mode === "simple";
   return (
     <div style={{ overflowX: "auto" }}>
       <table className="matrix">
@@ -30,11 +35,11 @@ export function Matrix({
             <th>Spot (CL)</th>
             <th>To beat</th>
             <th>Δ</th>
-            <th>Δ%</th>
+            {!simple && <th>Δ%</th>}
             <th>Ends</th>
-            <th>UP mkt</th>
-            <th>UP fair</th>
-            <th>Best edge</th>
+            {!simple && <th>UP mkt</th>}
+            {!simple && <th>UP fair</th>}
+            {!simple && <th>Best edge</th>}
             <th>Signal</th>
           </tr>
         </thead>
@@ -45,6 +50,7 @@ export function Matrix({
               s={s}
               focused={focus.asset === s.asset && focus.horizon === s.horizon}
               onFocus={onFocus}
+              simple={simple}
             />
           ))}
         </tbody>
@@ -57,10 +63,12 @@ function Row({
   s,
   focused,
   onFocus,
+  simple,
 }: {
   s: SessionState;
   focused: boolean;
   onFocus: (asset: AssetId, horizon: HorizonId) => void;
+  simple: boolean;
 }) {
   const sig = s.signal;
   const upMid = s.up?.mid ?? null;
@@ -82,14 +90,14 @@ function Row({
         {fmtUsd(s.strike)}
       </td>
       <td className={deltaCls}>{fmtDelta(s.delta)}</td>
-      <td className={deltaCls}>{fmtPct(s.deltaPct)}</td>
+      {!simple && <td className={deltaCls}>{fmtPct(s.deltaPct)}</td>}
       <td className="dim">{fmtCountdown(s.secondsLeft)}</td>
-      <td>{fmtCents(upMid)}</td>
-      <td className="gold">{fmtCents(sig?.fairUp)}</td>
-      <td className={bestEdge != null && bestEdge > 0 ? "pos" : "dim"}>{fmtSignedCents(bestEdge)}</td>
-      <td>
-        <SignalChip s={s} />
-      </td>
+      {!simple && <td>{fmtCents(upMid)}</td>}
+      {!simple && <td className="gold">{fmtCents(sig?.fairUp)}</td>}
+      {!simple && (
+        <td className={bestEdge != null && bestEdge > 0 ? "pos" : "dim"}>{fmtSignedCents(bestEdge)}</td>
+      )}
+      <td>{simple ? <VerdictBadge v={verdictForSession(s)} /> : <SignalChip s={s} />}</td>
     </tr>
   );
 }

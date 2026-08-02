@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { AssetId, HorizonId, SessionState } from "@polysignal/shared";
 import { useLiveData } from "./ws";
+import type { ViewMode } from "./components/Verdict";
 import { Header } from "./components/Header";
 import { Matrix } from "./components/Matrix";
 import { FocusPanel } from "./components/FocusPanel";
@@ -14,6 +15,15 @@ export default function App() {
     asset: "btc",
     horizon: "15m",
   });
+  // Single source of truth for Simple/Expert, shared by the focus panel and
+  // the matrix; persisted so the choice survives reloads.
+  const [mode, setMode] = useState<ViewMode>(
+    () => (localStorage.getItem("polysignal-view-mode") === "simple" ? "simple" : "expert"),
+  );
+  const changeMode = (m: ViewMode) => {
+    setMode(m);
+    localStorage.setItem("polysignal-view-mode", m);
+  };
 
   const focusedSession: SessionState | null = useMemo(() => {
     if (!state) return null;
@@ -36,7 +46,7 @@ export default function App() {
             <h2>
               Live market matrix <span className="dim">— Chainlink resolution feed</span>
             </h2>
-            <Matrix state={state} focus={focus} onFocus={onFocus} />
+            <Matrix state={state} focus={focus} onFocus={onFocus} mode={mode} />
           </div>
           <div className="card">
             <h2>
@@ -50,7 +60,7 @@ export default function App() {
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <FocusPanel session={focusedSession} />
+          <FocusPanel session={focusedSession} mode={mode} onModeChange={changeMode} />
           <TradePanel state={state} session={focusedSession} />
         </div>
       </div>
