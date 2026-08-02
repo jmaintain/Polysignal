@@ -1,193 +1,218 @@
 /**
- * Diagnostic probe: prints raw feed frames and market-discovery data so
- * protocol assumptions can be verified against the live services.
+ * Kalshi diagnostic probe: discovers the real crypto series tickers, market
+ * field shapes, orderbook format, fee metadata, and (with an API key) tests
+ * websocket auth — so the port runs on verified facts, not guesses.
  *
- *   npm run probe          (from the repo root)
+ *   npm run probe                    (from the repo root)
+ *
+ * Optional .env for the WS auth test:
+ *   KALSHI_API_KEY_ID=...
+ *   KALSHI_PRIVATE_KEY_PATH=./kalshi-key.pem   (or KALSHI_PRIVATE_KEY inline)
  */
+import "dotenv/config";
+import { createSign, constants as cryptoConstants } from "node:crypto";
+import { readFileSync } from "node:fs";
 import WebSocket from "ws";
-import { GAMMA_URL, RTDS_URL, USER_AGENT } from "./config.js";
-import { fetchJson, slotStartSec } from "./services/discovery.js";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const BASE = "https://api.elections.kalshi.com/trade-api/v2";
+const WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 
-interface Sample {
-  rawFrames: string[];
-  ticks: { ts: number; value: number }[];
-  historyCount: number;
-  historyFirstTs: number | null;
-  historyLastTs: number | null;
-}
+const trunc = (v: unknown, n = 110): string => {
+  const s = JSON.stringify(v);
+  return s == null ? "null" : s.length > n ? s.slice(0, n) + "…" : s;
+};
 
-function sampleTopic(topic: string, symbol: string, seconds: number): Promise<Sample> {
-  return new Promise((resolve) => {
-    const out: Sample = { rawFrames: [], ticks: [], historyCount: 0, historyFirstTs: null, historyLastTs: null };
-    const ws = new WebSocket(RTDS_URL);
-    const ping = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 5000);
-    ws.on("open", () => {
-      ws.send(
-        JSON.stringify({
-          action: "subscribe",
-          subscriptions: [{ topic, type: "update", filters: JSON.stringify({ symbol }) }],
-        }),
-      );
-    });
-    ws.on("message", (raw) => {
-      const text = raw.toString();
-      if (!text.includes("payload")) return;
-      if (out.rawFrames.length < 2) out.rawFrames.push(text.slice(0, 600));
-      try {
-        const msg = JSON.parse(text);
-        const p = msg.payload ?? {};
-        if (Array.isArray(p.data)) {
-          out.historyCount = p.data.length;
-          if (p.data.length > 0) {
-            out.historyFirstTs = Number(p.data[0].timestamp);
-            out.historyLastTs = Number(p.data[p.data.length - 1].timestamp);
-          }
-        } else if (p.value != null) {
-          out.ticks.push({ ts: Number(p.timestamp), value: Number(p.value) });
-        }
-      } catch {
-        /* ignore */
-      }
-    });
-    ws.on("error", (err) => console.log(`  [${topic}/${symbol}] ws error: ${String(err)}`));
-    setTimeout(() => {
-      clearInterval(ping);
-      ws.close();
-      resolve(out);
-    }, seconds * 1000);
+async function get(path: string): Promise<unknown> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(12000),
   });
+  if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`);
+  return res.json();
 }
 
-function describeTicks(s: Sample, label: string) {
-  console.log(`\n--- ${label} ---`);
-  for (const f of s.rawFrames) console.log(`  raw: ${f}`);
-  console.log(`  history dump: ${s.historyCount} rows, ts ${s.historyFirstTs} .. ${s.historyLastTs}`);
-  if (s.historyFirstTs) {
-    console.log(
-      `    (as dates, assuming ms: ${new Date(s.historyFirstTs).toISOString()} .. ${new Date(s.historyLastTs!).toISOString()})`,
-    );
-  }
-  console.log(`  live ticks in sample: ${s.ticks.length}`);
-  if (s.ticks.length > 1) {
-    const first = s.ticks[0];
-    const last = s.ticks[s.ticks.length - 1];
-    console.log(`  first tick: ts=${first.ts} value=${first.value}`);
-    console.log(`  last  tick: ts=${last.ts} value=${last.value}`);
-    console.log(`  ts as date (assuming ms): ${new Date(last.ts).toISOString()} | now: ${new Date().toISOString()}`);
-    const dts = s.ticks.slice(1).map((t, i) => t.ts - s.ticks[i].ts);
-    const distinct = new Set(s.ticks.map((t) => t.value)).size;
-    console.log(
-      `  dt(ms) min/median/max: ${Math.min(...dts)}/${[...dts].sort((a, b) => a - b)[Math.floor(dts.length / 2)]}/${Math.max(...dts)}; distinct prices: ${distinct}/${s.ticks.length}`,
-    );
-  }
-}
-
-async function tryslug(slug: string): Promise<string> {
-  try {
-    const events = await fetchJson<Record<string, unknown>[]>(
-      `${GAMMA_URL}/events?slug=${encodeURIComponent(slug)}`,
-      8000,
-    );
-    if (Array.isArray(events) && events.length > 0) {
-      const markets = (events[0] as { markets?: unknown[] }).markets;
-      return `FOUND (markets: ${Array.isArray(markets) ? markets.length : 0})`;
-    }
-    return "empty";
-  } catch (err) {
-    return `error: ${(err as Error).message}`;
-  }
+function dumpObj(obj: Record<string, unknown>, prefix: string): void {
+  for (const [k, v] of Object.entries(obj)) console.log(`  ${prefix}${k}: ${trunc(v)}`);
 }
 
 async function main() {
-  console.log(`Polysignal probe @ ${new Date().toISOString()}`);
+  console.log(`Kalshi probe @ ${new Date().toISOString()}\n`);
 
-  // ---- 1. RTDS raw frames (20s each topic, BTC only) --------------------
-  const [cl, bn] = await Promise.all([
-    sampleTopic("crypto_prices_chainlink", "btc/usd", 20),
-    sampleTopic("crypto_prices", "BTCUSDT", 20),
-  ]);
-  describeTicks(cl, "crypto_prices_chainlink btc/usd");
-  describeTicks(bn, "crypto_prices BTCUSDT");
-
-  // ---- 2. Current 15m market: full field dump ---------------------------
-  const slot15 = slotStartSec(Date.now(), "15m");
-  const slug15 = `btc-updown-15m-${slot15}`;
-  console.log(`\n--- gamma event fields for ${slug15} ---`);
+  // ---- 1. Exchange status (also verifies connectivity) -------------------
   try {
-    const events = await fetchJson<Record<string, unknown>[]>(`${GAMMA_URL}/events?slug=${slug15}`);
-    const ev = events?.[0];
-    if (!ev) {
-      console.log("  event not found!");
-    } else {
-      const dump = (obj: Record<string, unknown>, prefix: string) => {
-        for (const [k, v] of Object.entries(obj)) {
-          if (k === "markets") continue;
-          const s = JSON.stringify(v);
-          console.log(`  ${prefix}${k}: ${s == null ? "null" : s.length > 110 ? s.slice(0, 110) + "…" : s}`);
-        }
-      };
-      dump(ev, "event.");
-      const market = (ev as { markets?: Record<string, unknown>[] }).markets?.[0];
-      if (market) dump(market, "market.");
-    }
+    const status = await get("/exchange/status");
+    console.log(`exchange/status: ${trunc(status)}`);
   } catch (err) {
-    console.log(`  error: ${(err as Error).message}`);
+    console.log(`exchange/status FAILED: ${(err as Error).message}`);
+    console.log("Cannot reach Kalshi — aborting probe.");
+    process.exit(1);
   }
 
-  // ---- 3. Hourly/daily slug candidates ----------------------------------
-  console.log("\n--- 1h/1d slug candidates ---");
-  const nowSec = Math.floor(Date.now() / 1000);
-  const hourSlot = Math.floor(nowSec / 3600) * 3600;
-  const daySlot = Math.floor(nowSec / 86400) * 86400;
-  const et = new Date().toLocaleString("en-US", {
-    timeZone: "America/New_York",
-    month: "numeric", day: "numeric", hour: "numeric", hour12: true,
-  });
-  const m = et.match(/(\d+)\/(\d+),\s*(\d+)\s*(AM|PM)/i);
-  const MONTHS = ["january","february","march","april","may","june","july","august","september","october","november","december"];
-  const monthName = m ? MONTHS[Number(m[1]) - 1] : "august";
-  const day = m ? m[2] : "1";
-  const hour = m ? `${m[3]}${m[4].toLowerCase()}` : "12am";
-  const candidates = [
-    `btc-updown-1h-${hourSlot}`,
-    `btc-updown-60m-${hourSlot}`,
-    `btc-up-or-down-1h-${hourSlot}`,
-    `bitcoin-up-or-down-${monthName}-${day}-${hour}-et`,
-    `btc-updown-1d-${daySlot}`,
-    `btc-updown-24h-${daySlot}`,
-    `btc-updown-daily-${daySlot}`,
-    `bitcoin-up-or-down-on-${monthName}-${day}`,
-    `bitcoin-up-or-down-${monthName}-${day}`,
-  ];
-  for (const slug of candidates) {
-    console.log(`  ${slug}: ${await tryslug(slug)}`);
-  }
-
-  // ---- 4. Search for the real series names ------------------------------
-  console.log("\n--- gamma public-search for up/down series ---");
-  for (const q of ["bitcoin up or down", "btc-updown"]) {
+  // ---- 2. Find crypto series ---------------------------------------------
+  console.log("\n--- series discovery ---");
+  const seriesTickers = new Set<string>();
+  // Try the series listing with plausible category names.
+  for (const cat of ["Crypto", "crypto", "Cryptocurrency", "Financials"]) {
     try {
-      const res = await fetch(
-        `${GAMMA_URL}/public-search?q=${encodeURIComponent(q)}&limit_per_type=8`,
-        { headers: { "user-agent": USER_AGENT }, signal: AbortSignal.timeout(8000) },
+      const body = (await get(`/series?category=${encodeURIComponent(cat)}`)) as {
+        series?: { ticker: string; title?: string; frequency?: string }[];
+      };
+      const hits = (body.series ?? []).filter((s) =>
+        /BTC|ETH|SOL|BITCOIN|ETHEREUM|SOLANA/i.test(`${s.ticker} ${s.title ?? ""}`),
       );
-      if (!res.ok) {
-        console.log(`  "${q}": HTTP ${res.status}`);
-        continue;
-      }
-      const body = (await res.json()) as { events?: { slug?: string; title?: string; endDate?: string }[] };
-      console.log(`  "${q}":`);
-      for (const e of body.events ?? []) {
-        console.log(`    ${e.slug}  (${e.title ?? ""}, ends ${e.endDate ?? "?"})`);
+      if (hits.length > 0) {
+        console.log(`  category "${cat}":`);
+        for (const s of hits) {
+          console.log(`    ${s.ticker}  freq=${s.frequency ?? "?"}  ${s.title ?? ""}`);
+          seriesTickers.add(s.ticker);
+        }
       }
     } catch (err) {
-      console.log(`  "${q}": ${(err as Error).message}`);
+      console.log(`  category "${cat}": ${(err as Error).message}`);
+    }
+  }
+  // Fallback: scan open events for crypto-looking tickers.
+  try {
+    let cursor = "";
+    for (let page = 0; page < 5; page++) {
+      const body = (await get(
+        `/events?status=open&limit=200${cursor ? `&cursor=${cursor}` : ""}`,
+      )) as { events?: { event_ticker: string; series_ticker?: string; title?: string }[]; cursor?: string };
+      for (const e of body.events ?? []) {
+        if (/BTC|ETH|SOL/i.test(e.event_ticker)) {
+          if (e.series_ticker) seriesTickers.add(e.series_ticker);
+        }
+      }
+      cursor = body.cursor ?? "";
+      if (!cursor) break;
+    }
+    console.log(`  crypto-ish series from open events: ${[...seriesTickers].join(", ") || "(none)"}`);
+  } catch (err) {
+    console.log(`  event scan: ${(err as Error).message}`);
+  }
+
+  // ---- 3. For each series: sample an open market in full -----------------
+  console.log("\n--- open markets per series (first market dumped in full) ---");
+  const sampleTickers: string[] = [];
+  for (const st of [...seriesTickers].slice(0, 12)) {
+    try {
+      const body = (await get(`/markets?series_ticker=${st}&status=open&limit=3`)) as {
+        markets?: Record<string, unknown>[];
+      };
+      const mkts = body.markets ?? [];
+      console.log(`\n  series ${st}: ${mkts.length} open (showing close times + strikes)`);
+      for (const m of mkts) {
+        console.log(
+          `    ${m.ticker}  close=${m.close_time}  strike_type=${m.strike_type} floor=${m.floor_strike} cap=${m.cap_strike} yes_bid=${m.yes_bid} yes_ask=${m.yes_ask}`,
+        );
+      }
+      if (mkts[0]) {
+        sampleTickers.push(String(mkts[0].ticker));
+        console.log(`  full dump of ${mkts[0].ticker}:`);
+        dumpObj(mkts[0], "    market.");
+      }
+    } catch (err) {
+      console.log(`  series ${st}: ${(err as Error).message}`);
     }
   }
 
-  await sleep(100);
+  // ---- 4. Orderbook shape -------------------------------------------------
+  console.log("\n--- orderbook shape ---");
+  for (const t of sampleTickers.slice(0, 2)) {
+    try {
+      const body = await get(`/markets/${t}/orderbook?depth=5`);
+      console.log(`  ${t}: ${trunc(body, 400)}`);
+    } catch (err) {
+      console.log(`  ${t}: ${(err as Error).message}`);
+    }
+  }
+
+  // ---- 5. A settled market (result fields for the backtest) ---------------
+  console.log("\n--- settled market sample (per series) ---");
+  for (const st of [...seriesTickers].slice(0, 6)) {
+    try {
+      const body = (await get(`/markets?series_ticker=${st}&status=settled&limit=1`)) as {
+        markets?: Record<string, unknown>[];
+      };
+      const m = body.markets?.[0];
+      if (m) {
+        console.log(
+          `  ${st}: ${m.ticker} result=${m.result} floor=${m.floor_strike} settlement fields: ` +
+            trunc(
+              Object.fromEntries(
+                Object.entries(m).filter(([k]) => /result|settle|expiration_value|expected/i.test(k)),
+              ),
+              300,
+            ),
+        );
+      }
+    } catch (err) {
+      console.log(`  ${st}: ${(err as Error).message}`);
+    }
+  }
+
+  // ---- 6. WS auth test (only if a key is configured) ----------------------
+  console.log("\n--- websocket auth test ---");
+  const keyId = process.env.KALSHI_API_KEY_ID;
+  let privateKey = process.env.KALSHI_PRIVATE_KEY;
+  if (!privateKey && process.env.KALSHI_PRIVATE_KEY_PATH) {
+    try {
+      privateKey = readFileSync(process.env.KALSHI_PRIVATE_KEY_PATH, "utf8");
+    } catch (err) {
+      console.log(`  cannot read KALSHI_PRIVATE_KEY_PATH: ${(err as Error).message}`);
+    }
+  }
+  if (!keyId || !privateKey) {
+    console.log("  skipped (set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY[_PATH] in .env to test)");
+  } else {
+    await new Promise<void>((resolve) => {
+      const ts = Date.now().toString();
+      const sign = createSign("SHA256");
+      sign.update(`${ts}GET/trade-api/ws/v2`);
+      const signature = sign.sign(
+        { key: privateKey!, padding: cryptoConstants.RSA_PKCS1_PSS_PADDING, saltLength: 32 },
+        "base64",
+      );
+      const ws = new WebSocket(WS_URL, {
+        headers: {
+          "KALSHI-ACCESS-KEY": keyId,
+          "KALSHI-ACCESS-SIGNATURE": signature,
+          "KALSHI-ACCESS-TIMESTAMP": ts,
+        },
+      });
+      const timer = setTimeout(() => {
+        console.log("  ws: timeout waiting for messages");
+        ws.close();
+        resolve();
+      }, 15000);
+      let count = 0;
+      ws.on("open", () => {
+        console.log("  ws: connected + authenticated OK");
+        ws.send(
+          JSON.stringify({
+            id: 1,
+            cmd: "subscribe",
+            params: { channels: ["ticker"], market_tickers: sampleTickers.slice(0, 2) },
+          }),
+        );
+      });
+      ws.on("message", (raw) => {
+        if (count++ < 4) console.log(`  ws msg: ${raw.toString().slice(0, 250)}`);
+        if (count >= 4) {
+          clearTimeout(timer);
+          ws.close();
+          resolve();
+        }
+      });
+      ws.on("error", (err) => {
+        console.log(`  ws error: ${String(err)}`);
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  console.log("\nprobe complete");
   process.exit(0);
 }
 
