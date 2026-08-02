@@ -94,17 +94,22 @@ export function candidateSlugs(asset: AssetId, horizon: HorizonId, nowMs: number
     case "15m":
       return [`${a.slugPrefix}-updown-15m-${slot}`];
     case "1h":
+      // Hourly series uses legacy word slugs ("bitcoin-up-or-down-august-1-10pm-et",
+      // verified live); the next hour is a fallback around rollover.
       return [
-        `${a.slugPrefix}-updown-1h-${slot}`,
         legacyHourlySlug(a.legacyName, slot),
+        legacyHourlySlug(a.legacyName, slot + 3600),
+        `${a.slugPrefix}-updown-1h-${slot}`,
       ].filter(Boolean);
     case "1d": {
-      // Daily sessions may be aligned to UTC midnight or to noon ET
-      // (legacy "up or down on <date>" markets resolve 12pm ET -> 12pm ET).
-      const utcMidnight = slot;
+      // Daily series uses "…-up-or-down-on-<et-date>" (noon-ET to noon-ET,
+      // verified live). Today's ET date may already be resolved after noon,
+      // so tomorrow is a first-class candidate; expired markets are rejected
+      // by discoverMarket.
       return [
-        `${a.slugPrefix}-updown-1d-${utcMidnight}`,
         legacyDailySlug(a.legacyName, nowMs / 1000),
+        legacyDailySlug(a.legacyName, nowMs / 1000 + 86400),
+        `${a.slugPrefix}-updown-1d-${slot}`,
       ].filter(Boolean);
     }
   }
@@ -136,6 +141,34 @@ function findStrike(objs: Record<string, unknown>[]): number | null {
       const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
       if (Number.isFinite(n) && n > 0) return n;
     }
+  }
+  return null;
+}
+
+/**
+ * crypto_fees_v2: fee/share = rate * min(p, 1-p)^exponent, taker-only.
+ * Falls back to takerBaseFee (bps) when feesEnabled without a schedule.
+ */
+function parseFeeSchedule(
+  market: GammaMarket,
+): { rate: number; exponent: number } | null {
+  let sched = market.feeSchedule as unknown;
+  if (typeof sched === "string") {
+    try {
+      sched = JSON.parse(sched);
+    } catch {
+      sched = null;
+    }
+  }
+  if (sched && typeof sched === "object") {
+    const s = sched as { rate?: number; exponent?: number };
+    if (typeof s.rate === "number" && s.rate > 0) {
+      return { rate: s.rate, exponent: typeof s.exponent === "number" ? s.exponent : 1 };
+    }
+  }
+  if (market.feesEnabled === true) {
+    const bps = Number(market.takerBaseFee);
+    if (Number.isFinite(bps) && bps > 0) return { rate: bps / 10000, exponent: 1 };
   }
   return null;
 }
@@ -173,15 +206,21 @@ export async function discoverMarket(
       const len = HORIZONS[horizon].seconds * 1000;
       const slotStartMs = slotStartSec(nowMs, horizon) * 1000;
       const endFromApi = market.endDate ? Date.parse(market.endDate) : NaN;
-      const startFromApi = market.startDate ? Date.parse(market.startDate) : NaN;
-      // Prefer API end time (authoritative for legacy alignments); fall back
-      // to the computed slot boundary.
+      // event.startTime / market.eventStartTime carry the authoritative
+      // session open (market.startDate is the *creation* time — not usable).
+      const sessionStart = Date.parse(
+        String(market.eventStartTime ?? event.startTime ?? ""),
+      );
       const endTs = Number.isFinite(endFromApi) ? endFromApi : slotStartMs + len;
-      const startTs = slug.includes("-updown-")
-        ? slotStartMs
-        : Number.isFinite(startFromApi)
-          ? startFromApi
+      const startTs = Number.isFinite(sessionStart)
+        ? sessionStart
+        : slug.includes("-updown-")
+          ? slotStartMs
           : endTs - len;
+      if (endTs <= nowMs) {
+        errors.push(`${slug}: already ended`);
+        continue;
+      }
       const info: MarketInfo = {
         slug,
         question: market.question ?? event.title ?? slug,
@@ -193,6 +232,7 @@ export async function discoverMarket(
         endTs,
         tickSize: market.orderPriceMinTickSize != null ? Number(market.orderPriceMinTickSize) : null,
         gammaMarketId: market.id != null ? String(market.id) : null,
+        feeSchedule: parseFeeSchedule(market),
       };
       const gammaStrike = findStrike([
         market as Record<string, unknown>,

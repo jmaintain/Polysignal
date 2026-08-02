@@ -73,7 +73,10 @@ export class Engine {
   private logEntries: LogEntry[] = [];
   private clob: ClobMarketFeed;
   private discoveryTimer: NodeJS.Timeout | null = null;
+  private diagTimer: NodeJS.Timeout | null = null;
   private stopped = false;
+  private liveCounts: Record<string, number> = {};
+  private lastIngestErrorTs = 0;
 
   /** Hook for the websocket server: called for every accepted price tick. */
   onTick: ((asset: AssetId, source: FeedSource, tick: PriceTick) => void) | null = null;
@@ -128,11 +131,22 @@ export class Engine {
         if (rolledOver || missing) void this.refreshSession(session);
       }
     }, 3000);
+    this.diagTimer = setInterval(() => {
+      const parts: string[] = [];
+      for (const asset of ASSET_IDS) {
+        const cl = this.liveCounts[`${asset}:chainlink`] ?? 0;
+        const bn = this.liveCounts[`${asset}:binance`] ?? 0;
+        parts.push(`${asset} cl:${cl} bn:${bn}`);
+      }
+      this.liveCounts = {};
+      this.log("info", `diag live ticks/min — ${parts.join("  ")}`);
+    }, 60000);
   }
 
   stop(): void {
     this.stopped = true;
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
+    if (this.diagTimer) clearInterval(this.diagTimer);
     this.clob.stop();
   }
 
@@ -161,22 +175,31 @@ export class Engine {
     st.lastPrice = tick.price;
     st.latencyMs = Date.now() - tick.ts;
     st.ticksPerMin = this.countTicksSince(buf, Date.now() - 60000);
+    this.liveCounts[`${asset}:${source}`] = (this.liveCounts[`${asset}:${source}`] ?? 0) + 1;
 
-    if (source === "chainlink") {
-      for (const v of a.vol) {
-        v.state = v.state
-          ? updateEwmaVar(v.state, tick.price, tick.ts, v.halfLifeSec)
-          : initEwmaVar(tick.price, tick.ts);
+    try {
+      if (source === "chainlink") {
+        for (const v of a.vol) {
+          v.state = v.state
+            ? updateEwmaVar(v.state, tick.price, tick.ts, v.halfLifeSec)
+            : initEwmaVar(tick.price, tick.ts);
+        }
+        this.captureBoundaries(asset, tick);
       }
-      this.captureBoundaries(asset, tick);
-    }
 
-    // Basis uses near-simultaneous pairs only.
-    const other = a.latest[source === "chainlink" ? "binance" : "chainlink"];
-    if (other && Math.abs(other.ts - tick.ts) < 3000) {
-      const cl = source === "chainlink" ? tick.price : other.price;
-      const bn = source === "binance" ? tick.price : other.price;
-      a.basis = updateBasis(a.basis, cl, bn);
+      // Basis uses near-simultaneous pairs only.
+      const other = a.latest[source === "chainlink" ? "binance" : "chainlink"];
+      if (other && Math.abs(other.ts - tick.ts) < 3000) {
+        const cl = source === "chainlink" ? tick.price : other.price;
+        const bn = source === "binance" ? tick.price : other.price;
+        a.basis = updateBasis(a.basis, cl, bn);
+      }
+    } catch (err) {
+      // Never let bookkeeping kill the tick stream; surface it loudly instead.
+      if (Date.now() - this.lastIngestErrorTs > 10000) {
+        this.lastIngestErrorTs = Date.now();
+        this.log("error", `ingest processing error (${asset}/${source}): ${(err as Error).stack ?? err}`);
+      }
     }
 
     this.onTick?.(asset, source, tick);
@@ -384,7 +407,7 @@ export class Engine {
       downImbalance: down?.imbalance ?? null,
       secondsLeft,
       horizonSec,
-      feeRate: FEE_RATE,
+      fee: market.feeSchedule ?? (FEE_RATE > 0 ? { rate: FEE_RATE, exponent: 1 } : null),
     });
 
     const signal: SignalState = {

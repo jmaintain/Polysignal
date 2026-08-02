@@ -59,6 +59,11 @@ export interface MarketInfo {
   /** Minimum tick size for orders on this market (price increments). */
   tickSize: number | null;
   gammaMarketId: string | null;
+  /**
+   * Taker fee schedule (crypto_fees_v2): fee/share = rate * min(p, 1-p)^exponent.
+   * Null when the market is feeless.
+   */
+  feeSchedule: { rate: number; exponent: number } | null;
 }
 
 export type StrikeSource =

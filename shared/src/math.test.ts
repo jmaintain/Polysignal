@@ -15,6 +15,7 @@ import {
   normCdf,
   probUp,
   sigmaPerSqrtSec,
+  takerFeePerShare,
   updateBasis,
   updateEwmaVar,
   type EwmaVarState,
@@ -188,9 +189,16 @@ describe("edges and sizing", () => {
     expect(buyEdge(0.4, 0.5)).toBeCloseTo(-0.1, 9);
   });
 
-  it("fees only tax winnings", () => {
-    // p*(1-c)*(1-f) - (1-p)*c
-    expect(buyEdge(0.6, 0.5, 0.1)).toBeCloseTo(0.6 * 0.5 * 0.9 - 0.4 * 0.5, 9);
+  it("crypto_fees_v2 taker fee = rate * min(p, 1-p)", () => {
+    expect(takerFeePerShare(0.115, 0.07)).toBeCloseTo(0.07 * 0.115, 9);
+    expect(takerFeePerShare(0.9, 0.07)).toBeCloseTo(0.07 * 0.1, 9);
+    expect(takerFeePerShare(0.5, 0.07, 2)).toBeCloseTo(0.07 * 0.25, 9);
+    expect(takerFeePerShare(0.5, 0)).toBe(0);
+  });
+
+  it("entry fee comes straight off the edge", () => {
+    const fee = takerFeePerShare(0.5, 0.07);
+    expect(buyEdge(0.6, 0.5, fee)).toBeCloseTo(0.1 - fee, 9);
   });
 
   it("kelly is (p-c)/(1-c) clamped", () => {
@@ -244,7 +252,7 @@ describe("compositeSignal", () => {
     downImbalance: 0,
     secondsLeft: 400,
     horizonSec: 900,
-    feeRate: 0,
+    fee: null,
   };
 
   it("recommends UP when the model sees cheap UP shares", () => {
@@ -269,6 +277,15 @@ describe("compositeSignal", () => {
     const s = compositeSignal({ ...base, probUp: 0.9, secondsLeft: 5 });
     expect(s.phase).toBe("LOCKED");
     expect(s.direction).toBe("NONE");
+  });
+
+  it("taker fees shrink the edge and can kill a marginal signal", () => {
+    const noFee = compositeSignal({ ...base, probUp: 0.54 });
+    const withFee = compositeSignal({ ...base, probUp: 0.54, fee: { rate: 0.07, exponent: 1 } });
+    expect(noFee.upBuyEdge!).toBeCloseTo(0.04, 9);
+    expect(withFee.upBuyEdge!).toBeCloseTo(0.04 - 0.07 * 0.5, 9);
+    expect(noFee.direction).toBe("UP");
+    expect(withFee.direction).toBe("NONE");
   });
 
   it("basis lead can tip a marginal call", () => {

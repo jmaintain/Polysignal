@@ -1,4 +1,5 @@
 import type { SessionState } from "@polysignal/shared";
+import { takerFeePerShare } from "@polysignal/shared";
 import { fmtCents, fmtCountdown, fmtDelta, fmtPct, fmtSignedCents, fmtUsd } from "../format";
 import { SignalChip } from "./Matrix";
 
@@ -81,12 +82,14 @@ export function FocusPanel({ session }: { session: SessionState | null }) {
           book={s.up}
           fair={sig?.fairUp ?? null}
           edge={sig?.upBuyEdge ?? null}
+          fee={feeAtAsk(s, s.up?.bestAsk)}
         />
         <OddsBox
           side="DOWN"
           book={s.down}
           fair={sig?.fairDown ?? null}
           edge={sig?.downBuyEdge ?? null}
+          fee={feeAtAsk(s, s.down?.bestAsk)}
         />
       </div>
 
@@ -130,16 +133,24 @@ export function FocusPanel({ session }: { session: SessionState | null }) {
   );
 }
 
+function feeAtAsk(s: SessionState, ask: number | null | undefined): number | null {
+  const sched = s.market?.feeSchedule;
+  if (!sched || ask == null) return null;
+  return takerFeePerShare(ask, sched.rate, sched.exponent);
+}
+
 function OddsBox({
   side,
   book,
   fair,
   edge,
+  fee,
 }: {
   side: "UP" | "DOWN";
   book: SessionState["up"];
   fair: number | null;
   edge: number | null;
+  fee: number | null;
 }) {
   const cls = side.toLowerCase() as "up" | "down";
   return (
@@ -149,9 +160,12 @@ function OddsBox({
       <div className="fair mono">
         bid {fmtCents(book?.bestBid)} / ask {fmtCents(book?.bestAsk)}
       </div>
-      <div className="fair mono">fair {fmtCents(fair)}</div>
+      <div className="fair mono">
+        fair {fmtCents(fair)}
+        {fee != null && <> · fee {fmtCents(fee)}</>}
+      </div>
       <div className={`edge mono ${edge != null && edge > 0 ? "pos" : "dim"}`}>
-        buy edge {fmtSignedCents(edge)}
+        buy edge {fmtSignedCents(edge)} <span className="dim">(net of fee)</span>
       </div>
     </div>
   );

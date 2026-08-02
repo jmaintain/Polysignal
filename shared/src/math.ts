@@ -190,13 +190,22 @@ export function breakevenMove(spot: number, strike: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Expected value per $1 share of buying at `price` when the true win
- * probability is `p`, after a fixed `feeRate` charged on winnings.
+ * Polymarket crypto_fees_v2 taker fee per share at a given price:
+ * fee = rate * min(p, 1-p)^exponent. (7% of the cheaper side at rate=0.07.)
  */
-export function buyEdge(p: number, price: number, feeRate = 0): number {
+export function takerFeePerShare(price: number, rate: number, exponent = 1): number {
+  if (!(price > 0) || price >= 1 || !(rate > 0)) return 0;
+  return rate * Math.pow(Math.min(price, 1 - price), exponent);
+}
+
+/**
+ * Expected value per $1 share of buying at `price` when the true win
+ * probability is `p`: p - price - feePerShare. `feePerShare` is the taker
+ * fee paid on entry (see takerFeePerShare).
+ */
+export function buyEdge(p: number, price: number, feePerShare = 0): number {
   if (!isFinite(p) || !(price > 0) || price >= 1) return NaN;
-  const grossWin = 1 - price;
-  return p * grossWin * (1 - feeRate) - (1 - p) * price;
+  return p - price - feePerShare;
 }
 
 /**
@@ -299,8 +308,8 @@ export interface SignalInputs {
   downImbalance: number | null;
   secondsLeft: number;
   horizonSec: number;
-  /** Fee rate charged on winnings (0 for feeless markets). */
-  feeRate: number;
+  /** Taker fee schedule; null for feeless markets. */
+  fee: { rate: number; exponent: number } | null;
 }
 
 export interface CompositeSignal {
@@ -323,10 +332,12 @@ const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x
 export function compositeSignal(inp: SignalInputs): CompositeSignal {
   const components: CompositeSignal["components"] = [];
 
+  const feeAt = (price: number) =>
+    inp.fee ? takerFeePerShare(price, inp.fee.rate, inp.fee.exponent) : 0;
   const upEdge =
-    inp.upAsk != null ? buyEdge(inp.probUp, inp.upAsk, inp.feeRate) : null;
+    inp.upAsk != null ? buyEdge(inp.probUp, inp.upAsk, feeAt(inp.upAsk)) : null;
   const downEdge =
-    inp.downAsk != null ? buyEdge(1 - inp.probUp, inp.downAsk, inp.feeRate) : null;
+    inp.downAsk != null ? buyEdge(1 - inp.probUp, inp.downAsk, feeAt(inp.downAsk)) : null;
 
   // 1. Model edge: scaled so a 5-cent edge saturates the component.
   let modelScore = 0;
@@ -389,9 +400,10 @@ export function compositeSignal(inp: SignalInputs): CompositeSignal {
 
   let kelly: number | null = null;
   if (direction === "UP" && inp.upAsk != null) {
-    kelly = 0.5 * kellyFraction(inp.probUp, inp.upAsk); // half-Kelly
+    // Kelly on the fee-inclusive effective price (half-Kelly).
+    kelly = 0.5 * kellyFraction(inp.probUp, Math.min(0.999, inp.upAsk + feeAt(inp.upAsk)));
   } else if (direction === "DOWN" && inp.downAsk != null) {
-    kelly = 0.5 * kellyFraction(1 - inp.probUp, inp.downAsk);
+    kelly = 0.5 * kellyFraction(1 - inp.probUp, Math.min(0.999, inp.downAsk + feeAt(inp.downAsk)));
   }
   if (kelly != null) kelly = Math.min(kelly, 0.1); // hard cap at 10% of bankroll
 
