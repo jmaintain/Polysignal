@@ -128,8 +128,19 @@ async function discoverInSeries(
     }
     ranked.sort((a, b) => a.close - b.close);
   }
+  // Last resort: the flat series query. Bounded pagination keeps a large
+  // ladder from being truncated the way a single page would be.
   if (ranked.length === 0) {
-    throw new NotListedError(`${seriesTicker}: no open markets ahead of now`);
+    const flat = await flatSeriesMarkets(api, seriesTicker, nowMs);
+    if (flat.length > 0) {
+      const close = Math.min(...flat.map((m) => Date.parse(m.close_time!)));
+      ranked.push({ eventTicker: flat[0].event_ticker, close, markets: flat });
+    }
+  }
+  if (ranked.length === 0) {
+    throw new NotListedError(
+      `${seriesTicker}: no open markets ahead of now (a session may be rolling over)`,
+    );
   }
 
   const session = ranked[0];
@@ -140,6 +151,28 @@ async function discoverInSeries(
     );
   }
   return info;
+}
+
+async function flatSeriesMarkets(
+  api: KalshiApi,
+  seriesTicker: string,
+  nowMs: number,
+): Promise<KalshiMarket[]> {
+  const out: KalshiMarket[] = [];
+  let cursor = "";
+  for (let page = 0; page < 6; page++) {
+    const body = await api.getMarkets({
+      series_ticker: seriesTicker,
+      status: "open",
+      limit: 200,
+      cursor: cursor || undefined,
+    });
+    const markets = (body.markets ?? []).filter((m) => isTradeable(m, nowMs));
+    out.push(...markets);
+    cursor = body.cursor ?? "";
+    if (!cursor || (body.markets ?? []).length === 0) break;
+  }
+  return out;
 }
 
 function isTradeable(m: KalshiMarket, nowMs: number): boolean {

@@ -102,8 +102,19 @@ async function main() {
     const spot = index[asset][index[asset].length - 1]?.price ?? null;
     for (const horizon of HORIZON_IDS) {
       try {
-        const { info } = await discoverMarket(api, asset, horizon, now, spot);
-        const secsLeft = (info.endTs - now) / 1000;
+        // Retry once across a session rollover: at :00/:15/:30/:45 the old
+        // 15m market is untradeable and the new one may not be listed yet,
+        // which is an exchange timing artifact rather than a defect.
+        let info;
+        try {
+          ({ info } = await discoverMarket(api, asset, horizon, Date.now(), spot));
+        } catch (err) {
+          if (!isNotListed(err)) throw err;
+          console.log(`    ${asset.toUpperCase()} ${horizon}: nothing listed, retrying in 10s…`);
+          await sleep(10000);
+          ({ info } = await discoverMarket(api, asset, horizon, Date.now(), spot));
+        }
+        const secsLeft = (info.endTs - Date.now()) / 1000;
         const okWindow = secsLeft > 0 && secsLeft <= HORIZONS[horizon].seconds + 3600;
         // The tracked strike must be the at-the-money rung. A truncated
         // ladder shows up here as a strike far from spot.
