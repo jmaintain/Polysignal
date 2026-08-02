@@ -194,12 +194,24 @@ async function main() {
       } else {
         const avg = windowTicks.reduce((s, t) => s + t.price, 0) / windowTicks.length;
         const ourCall = avg > next15.strike ? "yes" : "no";
+        console.log(
+          `  our 60s average: ${avg.toFixed(2)} from ${windowTicks.length} ticks ` +
+            `(strike ${next15.strike}) -> ${ourCall.toUpperCase()}; waiting for settlement…`,
+        );
         let result = "";
+        let settleValue: number | null = null;
         for (let i = 0; i < 40 && !result; i++) {
           await sleep(15000);
           try {
             const m = await api.getMarket(next15.ticker);
             result = String(m.market.result ?? "");
+            // CF Benchmarks' actual settlement number, when published.
+            const raw =
+              m.market.expiration_value ??
+              (m.market as Record<string, unknown>).settlement_value ??
+              (m.market as Record<string, unknown>).expiration_value_dollars;
+            const parsed = Number(String(raw ?? "").replace(/[$,]/g, ""));
+            if (Number.isFinite(parsed) && parsed > 0) settleValue = parsed;
           } catch {
             /* retry */
           }
@@ -211,9 +223,25 @@ async function main() {
           record(
             "settlement agreement",
             result === ourCall,
-            `our 60s avg ${avg.toFixed(2)} vs strike ${next15.strike} -> ${ourCall.toUpperCase()}; ` +
-              `Kalshi settled ${result.toUpperCase()} (margin $${margin.toFixed(2)})`,
+            `our 60s avg ${avg.toFixed(2)} -> ${ourCall.toUpperCase()}; ` +
+              `Kalshi settled ${result.toUpperCase()} (we were $${margin.toFixed(2)} from the strike)`,
           );
+          // The stronger check: our index average vs CF Benchmarks' own.
+          if (settleValue != null) {
+            const errPct = Math.abs(avg - settleValue) / settleValue;
+            record(
+              "index accuracy vs CF Benchmarks",
+              errPct < 0.001,
+              `ours ${avg.toFixed(2)} vs official ${settleValue.toFixed(2)} — ` +
+                `${(errPct * 10000).toFixed(1)} bps error`,
+            );
+          } else {
+            record(
+              "index accuracy vs CF Benchmarks",
+              null,
+              "Kalshi published no settlement value for this market",
+            );
+          }
         }
       }
     }
