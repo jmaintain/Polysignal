@@ -22,7 +22,7 @@ import type { AssetId, PriceTick } from "@polysignal/shared";
 import { ASSET_IDS, HORIZON_IDS, HORIZONS } from "./config.js";
 import { IndexProxyService } from "./services/indexProxy.js";
 import { discoverMarket } from "./services/discovery.js";
-import { KalshiApi, loadCredentials } from "./services/kalshiApi.js";
+import { KalshiApi, loadCredentials, topOfBook } from "./services/kalshiApi.js";
 
 interface CheckResult {
   name: string;
@@ -128,14 +128,17 @@ async function main() {
         limit: 100,
       });
       for (const m of body.markets ?? []) {
-        const yb = Number(m.yes_bid);
-        const ya = Number(m.yes_ask);
-        const nb = Number(m.no_bid);
-        const identity = Number.isFinite(ya) && Number.isFinite(nb) ? Math.abs(ya - (100 - nb)) : 99;
+        const tob = topOfBook(m);
+        if (tob.yesBid == null || tob.yesAsk == null || tob.noBid == null) {
+          record(`book ${m.ticker}`, false, `missing top-of-book (${JSON.stringify(tob)})`);
+          continue;
+        }
+        const identity = Math.abs(tob.yesAsk - (1 - tob.noBid));
         record(
           `book ${m.ticker}`,
-          yb < ya && identity <= 1,
-          `yes ${yb}/${ya}c no_bid ${nb}c (identity off by ${identity}c)`,
+          tob.yesBid < tob.yesAsk && identity <= 0.011,
+          `yes ${(tob.yesBid * 100).toFixed(0)}/${(tob.yesAsk * 100).toFixed(0)}c ` +
+            `no_bid ${(tob.noBid * 100).toFixed(0)}c (identity off by ${(identity * 100).toFixed(1)}c)`,
         );
       }
     } catch (err) {

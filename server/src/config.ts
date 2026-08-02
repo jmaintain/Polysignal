@@ -65,13 +65,21 @@ export const ASSET_IDS = Object.keys(ASSETS) as AssetId[];
 export const HORIZON_IDS = Object.keys(HORIZONS) as HorizonId[];
 
 /**
- * Kalshi series tickers per asset/horizon. Auto-discovered at runtime by
- * scanning open events (see discovery.ts); these env vars pin them when the
- * scan is ambiguous, e.g. KALSHI_SERIES_BTC_15M=KXBTC15M.
+ * Kalshi series tickers per asset/horizon, verified live via `npm run
+ * probe` (2026-08-02): the 15m series are the "price up down" family, the
+ * hourly are the "Above/below"/"Directional" family, dailies are the
+ * legacy above/below series. SOL has no daily series on Kalshi today.
+ * KALSHI_SERIES_<ASSET>_<HORIZON> env vars override.
  */
-export function seriesOverride(asset: AssetId, horizon: HorizonId): string | null {
+export const SERIES_DEFAULTS: Record<AssetId, Record<HorizonId, string | null>> = {
+  btc: { "15m": "KXBTC15M", "1h": "KXBTCD", "1d": "BTCD" },
+  eth: { "15m": "KXETH15M", "1h": "KXETHD", "1d": "ETHD" },
+  sol: { "15m": "KXSOL15M", "1h": "KXSOLD", "1d": null },
+};
+
+export function seriesFor(asset: AssetId, horizon: HorizonId): string | null {
   const key = `KALSHI_SERIES_${asset.toUpperCase()}_${horizon.toUpperCase()}`;
-  return process.env[key] || null;
+  return process.env[key] || SERIES_DEFAULTS[asset][horizon];
 }
 
 /** CF Benchmarks settlement rule: average of the final 60 seconds. */

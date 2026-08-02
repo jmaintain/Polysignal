@@ -1,117 +1,19 @@
 import type { AssetId, HorizonId, MarketInfo } from "@polysignal/shared";
 import {
-  ASSETS,
   HORIZONS,
   HORIZON_IDS,
   KALSHI_FEE_RATE,
   SETTLE_WINDOW_SEC,
-  seriesOverride,
+  seriesFor,
 } from "../config.js";
-import type { KalshiApi, KalshiMarket } from "./kalshiApi.js";
+import { priceDollars, type KalshiApi, type KalshiMarket } from "./kalshiApi.js";
 
 /**
- * Kalshi market discovery.
- *
- * Rather than guessing ticker formats, we scan open events for series whose
- * tickers mention the asset, then classify each series' horizon from the
- * cadence of its open markets' close times (15m closes every quarter hour,
- * hourly on the hour, daily ~24h apart). KALSHI_SERIES_<ASSET>_<HORIZON>
- * env vars pin a series explicitly when needed.
+ * Kalshi market discovery. Series tickers are probe-verified constants
+ * (config.SERIES_DEFAULTS, overridable via env). Within a series we take
+ * the session closing soonest and, for strike ladders (hourly/daily), the
+ * at-the-money strike.
  */
-
-interface SeriesCatalog {
-  /** asset -> horizon -> series ticker */
-  map: Map<string, string>;
-  builtAt: number;
-}
-
-let catalog: SeriesCatalog | null = null;
-let catalogPromise: Promise<SeriesCatalog> | null = null;
-const CATALOG_TTL_MS = 30 * 60 * 1000;
-
-const key = (asset: AssetId, horizon: HorizonId) => `${asset}:${horizon}`;
-
-async function scanSeries(api: KalshiApi, log: (m: string) => void): Promise<SeriesCatalog> {
-  const seriesByAsset = new Map<AssetId, Set<string>>();
-  for (const a of Object.keys(ASSETS) as AssetId[]) seriesByAsset.set(a, new Set());
-
-  let cursor = "";
-  for (let page = 0; page < 10; page++) {
-    const body = await api.getEvents({ status: "open", limit: 200, cursor: cursor || undefined });
-    for (const ev of body.events ?? []) {
-      const st = ev.series_ticker;
-      if (!st) continue;
-      for (const a of Object.keys(ASSETS) as AssetId[]) {
-        if (ASSETS[a].tickerMatch.test(st) || ASSETS[a].tickerMatch.test(ev.event_ticker)) {
-          seriesByAsset.get(a)!.add(st);
-        }
-      }
-    }
-    cursor = body.cursor ?? "";
-    if (!cursor) break;
-  }
-
-  const map = new Map<string, string>();
-  for (const [asset, tickers] of seriesByAsset) {
-    for (const st of tickers) {
-      try {
-        const horizon = await classifySeries(api, st);
-        if (horizon && !map.has(key(asset, horizon))) {
-          map.set(key(asset, horizon), st);
-          log(`discovery: ${asset.toUpperCase()} ${horizon} -> series ${st}`);
-        }
-      } catch {
-        /* skip unclassifiable series */
-      }
-    }
-  }
-  return { map, builtAt: Date.now() };
-}
-
-/** Infer a series' horizon from the cadence of its open markets. */
-async function classifySeries(api: KalshiApi, seriesTicker: string): Promise<HorizonId | null> {
-  const body = await api.getMarkets({ series_ticker: seriesTicker, status: "open", limit: 40 });
-  const markets = body.markets ?? [];
-  const closes = [...new Set(markets.map((m) => Date.parse(m.close_time ?? "")))].filter(
-    Number.isFinite,
-  );
-  if (closes.length === 0) return null;
-  closes.sort((a, b) => a - b);
-  // Cadence between distinct close times, when multiple sessions are open.
-  if (closes.length >= 2) {
-    const gaps = closes.slice(1).map((c, i) => (c - closes[i]) / 1000);
-    const minGap = Math.min(...gaps);
-    if (minGap <= 1200) return "15m";
-    if (minGap <= 7200) return "1h";
-    return "1d";
-  }
-  // Single session open: use alignment of the close time.
-  const d = new Date(closes[0]);
-  if (d.getUTCMinutes() % 15 === 0 && d.getUTCMinutes() !== 0) return "15m";
-  // Ambiguous — check how far out it closes.
-  const hoursOut = (closes[0] - Date.now()) / 3.6e6;
-  if (hoursOut <= 0.3) return null; // about to roll; skip this pass
-  return hoursOut <= 1.5 ? "1h" : "1d";
-}
-
-async function getCatalog(api: KalshiApi, log: (m: string) => void): Promise<SeriesCatalog> {
-  if (catalog && Date.now() - catalog.builtAt < CATALOG_TTL_MS) return catalog;
-  if (!catalogPromise) {
-    catalogPromise = scanSeries(api, log)
-      .then((c) => {
-        catalog = c;
-        return c;
-      })
-      .finally(() => {
-        catalogPromise = null;
-      });
-  }
-  return catalogPromise;
-}
-
-export function invalidateCatalog(): void {
-  catalog = null;
-}
 
 export interface DiscoveredMarket {
   info: MarketInfo;
@@ -125,28 +27,21 @@ export async function discoverMarket(
   spotHint: number | null,
   log: (m: string) => void,
 ): Promise<DiscoveredMarket> {
-  const pinned = seriesOverride(asset, horizon);
-  let seriesTicker = pinned;
+  void log;
+  const seriesTicker = seriesFor(asset, horizon);
   if (!seriesTicker) {
-    const cat = await getCatalog(api, log);
-    seriesTicker = cat.map.get(key(asset, horizon)) ?? null;
-  }
-  if (!seriesTicker) {
-    throw new Error(
-      `no Kalshi series found for ${asset} ${horizon} (pin with KALSHI_SERIES_${asset.toUpperCase()}_${horizon.toUpperCase()})`,
-    );
+    throw new Error(`Kalshi has no ${horizon} series for ${asset.toUpperCase()}`);
   }
 
   const body = await api.getMarkets({ series_ticker: seriesTicker, status: "open", limit: 100 });
   const markets = (body.markets ?? []).filter((m) => {
     const close = Date.parse(m.close_time ?? "");
-    return Number.isFinite(close) && close > nowMs + 5000;
+    return Number.isFinite(close) && close > nowMs + 5000 && m.status !== "settled";
   });
   if (markets.length === 0) throw new Error(`${seriesTicker}: no open markets ahead of now`);
 
   // The active session = the earliest close time still in the future.
-  const closes = markets.map((m) => Date.parse(m.close_time!));
-  const sessionClose = Math.min(...closes);
+  const sessionClose = Math.min(...markets.map((m) => Date.parse(m.close_time!)));
   const sessionMarkets = markets.filter((m) => Date.parse(m.close_time!) === sessionClose);
 
   const market = pickAtmMarket(sessionMarkets, spotHint);
@@ -156,16 +51,18 @@ export async function discoverMarket(
   if (!Number.isFinite(strike)) {
     throw new Error(`${market.ticker}: missing floor_strike`);
   }
-  const endTs = Number.isFinite(Date.parse(market.expected_expiration_time ?? ""))
-    ? Date.parse(market.expected_expiration_time!)
-    : sessionClose;
+
+  // Settlement references the final minute BEFORE close_time (the rules'
+  // "sixty seconds before <time>"); expected_expiration_time is the later
+  // certification timestamp and must NOT shift the averaging window.
+  const endTs = sessionClose;
 
   const info: MarketInfo = {
     ticker: market.ticker,
     eventTicker: market.event_ticker,
     seriesTicker,
     title: market.title ?? market.ticker,
-    yesSubTitle: market.yes_sub_title ?? market.subtitle ?? null,
+    yesSubTitle: market.yes_sub_title && market.yes_sub_title !== "na" ? market.yes_sub_title : null,
     strike,
     strikeType: market.strike_type === "less" ? "less" : "greater",
     startTs: endTs - HORIZONS[horizon].seconds * 1000,
@@ -196,9 +93,11 @@ function pickAtmMarket(markets: KalshiMarket[], spotHint: number | null): Kalshi
         Math.abs(Number(b.floor_strike ?? b.cap_strike) - spotHint),
     )[0];
   }
-  return [...pool].sort(
-    (a, b) => Math.abs((a.yes_bid ?? 50) - 50) - Math.abs((b.yes_bid ?? 50) - 50),
-  )[0];
+  return [...pool].sort((a, b) => {
+    const pa = priceDollars(a, "yes_bid") ?? 0.5;
+    const pb = priceDollars(b, "yes_bid") ?? 0.5;
+    return Math.abs(pa - 0.5) - Math.abs(pb - 0.5);
+  })[0];
 }
 
 export { HORIZON_IDS };

@@ -2,7 +2,14 @@ import WebSocket from "ws";
 import type { TokenBook } from "@polysignal/shared";
 import { bookImbalance, microprice } from "@polysignal/shared";
 import { KALSHI_WS_PATH, KALSHI_WS_URL } from "../config.js";
-import { signHeaders, type KalshiApi, type KalshiCredentials } from "../services/kalshiApi.js";
+import {
+  normalizeLevels,
+  signHeaders,
+  topOfBook,
+  type KalshiApi,
+  type KalshiCredentials,
+  type KalshiOrderbook,
+} from "../services/kalshiApi.js";
 
 export type BookSide = "up" | "down"; // up = YES (above strike), down = NO
 
@@ -71,8 +78,10 @@ export class KalshiBooksFeed {
   start(): void {
     this.closed = false;
     if (this.mode === "rest") {
-      this.pollTimer = setInterval(() => void this.pollTopOfBook(), 2000);
-      this.depthTimer = setInterval(() => void this.pollDepth(), 6000);
+      // Kalshi rate-limits hard; one batch top-of-book call every 2.5s and
+      // a slow depth loop keep us well under the unauthenticated budget.
+      this.pollTimer = setInterval(() => void this.pollTopOfBook(), 2500);
+      this.depthTimer = setInterval(() => void this.pollDepth(), 15000);
       this.opts.log?.("[kalshi-books] REST polling mode (no API key; add one for websocket depth)");
     }
   }
@@ -152,12 +161,17 @@ export class KalshiBooksFeed {
     if (!st) return;
 
     if (type === "orderbook_snapshot") {
-      st.yes = levelsToMap(msg.yes);
-      st.no = levelsToMap(msg.no);
+      const book = msg as KalshiOrderbook;
+      st.yes = new Map(normalizeLevels(book.yes, book.yes_dollars));
+      st.no = new Map(normalizeLevels(book.no, book.no_dollars));
       st.updatedTs = Date.now();
     } else if (type === "orderbook_delta") {
-      const price = Number(msg.price);
-      const delta = Number(msg.delta);
+      // price may arrive as cents (legacy) or a dollar string (price_dollars).
+      const price =
+        msg.price_dollars != null
+          ? Math.round(Number(msg.price_dollars) * 100)
+          : Number(msg.price);
+      const delta = Number(msg.delta ?? msg.delta_fp);
       const side = String(msg.side) === "no" ? st.no : st.yes;
       if (Number.isFinite(price) && Number.isFinite(delta)) {
         const next = (side.get(price) ?? 0) + delta;
@@ -166,7 +180,10 @@ export class KalshiBooksFeed {
         st.updatedTs = Date.now();
       }
     } else if (type === "ticker") {
-      const p = Number(msg.price ?? msg.last_price);
+      const p =
+        msg.price_dollars != null
+          ? Math.round(Number(msg.price_dollars) * 100)
+          : Number(msg.price ?? msg.last_price);
       if (Number.isFinite(p) && p > 0) st.lastYesPrice = p;
       st.updatedTs = Date.now();
     } else {
@@ -184,17 +201,16 @@ export class KalshiBooksFeed {
       for (const m of body.markets ?? []) {
         const st = this.books.get(m.ticker);
         if (!st) continue;
-        // Synthesize one-level books from top-of-book cents.
-        const yesBid = Number(m.yes_bid);
-        const noBid = Number(m.no_bid);
-        if (yesBid > 0) {
-          if (st.yes.size === 0 || !this.depthFresh(st)) st.yes = new Map([[yesBid, st.yes.get(yesBid) ?? 1]]);
+        // Synthesize one-level books from top-of-book (both API shapes).
+        const tob = topOfBook(m);
+        const depthAge = Date.now() - (this.depthTs.get(m.ticker) ?? 0);
+        if (tob.yesBid != null && depthAge > 20000) {
+          st.yes = new Map([[Math.round(tob.yesBid * 100), 1]]);
         }
-        if (noBid > 0) {
-          if (st.no.size === 0 || !this.depthFresh(st)) st.no = new Map([[noBid, st.no.get(noBid) ?? 1]]);
+        if (tob.noBid != null && depthAge > 20000) {
+          st.no = new Map([[Math.round(tob.noBid * 100), 1]]);
         }
-        const last = Number(m.last_price);
-        if (last > 0) st.lastYesPrice = last;
+        if (tob.last != null) st.lastYesPrice = Math.round(tob.last * 100);
         st.updatedTs = Date.now();
         this.emit(m.ticker, st);
       }
@@ -207,19 +223,15 @@ export class KalshiBooksFeed {
 
   private depthTs = new Map<string, number>();
 
-  private depthFresh(st: RawBook): boolean {
-    void st;
-    return false;
-  }
-
   private async pollDepth(): Promise<void> {
     for (const ticker of this.tickers) {
       try {
         const body = await this.api.getOrderbook(ticker, DEPTH_LEVELS + 3);
+        const book = body.orderbook_fp ?? body.orderbook;
         const st = this.books.get(ticker);
-        if (!st) continue;
-        st.yes = levelsToMap(body.orderbook?.yes);
-        st.no = levelsToMap(body.orderbook?.no);
+        if (!st || !book) continue;
+        st.yes = new Map(normalizeLevels(book.yes, book.yes_dollars));
+        st.no = new Map(normalizeLevels(book.no, book.no_dollars));
         st.updatedTs = Date.now();
         this.depthTs.set(ticker, Date.now());
         this.emit(ticker, st);
@@ -245,18 +257,6 @@ export class KalshiBooksFeed {
       ),
     );
   }
-}
-
-function levelsToMap(levels: unknown): Map<number, number> {
-  const map = new Map<number, number>();
-  if (!Array.isArray(levels)) return map;
-  for (const l of levels) {
-    if (!Array.isArray(l)) continue;
-    const price = Number(l[0]);
-    const count = Number(l[1]);
-    if (price > 0 && price < 100 && count > 0) map.set(price, count);
-  }
-  return map;
 }
 
 /**

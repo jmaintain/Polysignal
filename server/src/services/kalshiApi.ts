@@ -37,6 +37,59 @@ export interface KalshiEvent {
 export interface KalshiOrderbook {
   yes?: [number, number][];
   no?: [number, number][];
+  /** Newer API shape: dollar-string prices with fractional sizes. */
+  yes_dollars?: [string, string][];
+  no_dollars?: [string, string][];
+}
+
+/**
+ * The 2026 Kalshi API reports prices as dollar strings (yes_bid_dollars:
+ * "0.0300") alongside — or instead of — the legacy cents integers. These
+ * helpers normalize both shapes to dollars (0..1).
+ */
+export function priceDollars(m: KalshiMarket, base: string): number | null {
+  const d = m[`${base}_dollars`];
+  if (d != null) {
+    const v = Number(d);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  }
+  const c = m[base];
+  const v = Number(c);
+  return Number.isFinite(v) && v > 0 ? v / 100 : null;
+}
+
+export function topOfBook(m: KalshiMarket): {
+  yesBid: number | null;
+  yesAsk: number | null;
+  noBid: number | null;
+  noAsk: number | null;
+  last: number | null;
+} {
+  return {
+    yesBid: priceDollars(m, "yes_bid"),
+    yesAsk: priceDollars(m, "yes_ask"),
+    noBid: priceDollars(m, "no_bid"),
+    noAsk: priceDollars(m, "no_ask"),
+    last: priceDollars(m, "last_price"),
+  };
+}
+
+/** Normalize an orderbook side (either shape) to [cents, contracts][]. */
+export function normalizeLevels(
+  legacy: [number, number][] | undefined,
+  dollars: [string, string][] | undefined,
+): [number, number][] {
+  if (Array.isArray(dollars)) {
+    return dollars
+      .map(([p, s]): [number, number] => [Math.round(Number(p) * 100), Number(s)])
+      .filter(([p, s]) => p > 0 && p < 100 && s > 0);
+  }
+  if (Array.isArray(legacy)) {
+    return legacy
+      .map(([p, s]): [number, number] => [Number(p), Number(s)])
+      .filter(([p, s]) => p > 0 && p < 100 && s > 0);
+  }
+  return [];
 }
 
 export interface KalshiCredentials {
@@ -83,14 +136,49 @@ export function signHeaders(
   };
 }
 
+/** Minimum gap between outbound requests (Kalshi rate-limits aggressively). */
+const REQUEST_GAP_MS = 150;
+
 export class KalshiApi {
+  private lastRequestAt = 0;
+  private queue: Promise<void> = Promise.resolve();
+
   constructor(private readonly creds: KalshiCredentials | null = null) {}
 
   get authenticated(): boolean {
     return this.creds !== null;
   }
 
+  /** Serialize requests with a minimum gap; retry once on HTTP 429. */
+  private async throttled<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(async () => {
+      const wait = this.lastRequestAt + REQUEST_GAP_MS - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      this.lastRequestAt = Date.now();
+    });
+    this.queue = run.catch(() => {});
+    await run;
+    try {
+      return await fn();
+    } catch (err) {
+      if (String((err as Error).message).includes("HTTP 429")) {
+        await new Promise((r) => setTimeout(r, 1200));
+        this.lastRequestAt = Date.now();
+        return fn();
+      }
+      throw err;
+    }
+  }
+
   private async request<T>(
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    opts: { query?: Record<string, string | number | undefined>; body?: unknown; auth?: boolean } = {},
+  ): Promise<T> {
+    return this.throttled(() => this.requestOnce(method, path, opts));
+  }
+
+  private async requestOnce<T>(
     method: "GET" | "POST" | "DELETE",
     path: string,
     opts: { query?: Record<string, string | number | undefined>; body?: unknown; auth?: boolean } = {},
@@ -140,7 +228,10 @@ export class KalshiApi {
     return this.request("GET", `/markets/${ticker}`);
   }
 
-  getOrderbook(ticker: string, depth = 8): Promise<{ orderbook: KalshiOrderbook }> {
+  getOrderbook(
+    ticker: string,
+    depth = 8,
+  ): Promise<{ orderbook?: KalshiOrderbook; orderbook_fp?: KalshiOrderbook }> {
     return this.request("GET", `/markets/${ticker}/orderbook`, { query: { depth } });
   }
 
