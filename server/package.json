@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc --noEmit",
-    "validate": "tsx src/validate.ts"
+    "validate": "tsx src/validate.ts",
+    "probe": "tsx src/probe.ts"
   },
   "dependencies": {
     "@polysignal/shared": "1.0.0",
