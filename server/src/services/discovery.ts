@@ -44,6 +44,13 @@ export async function discoverMarket(
   const sessionClose = Math.min(...markets.map((m) => Date.parse(m.close_time!)));
   const sessionMarkets = markets.filter((m) => Date.parse(m.close_time!) === sessionClose);
 
+  // Never pick from a strike ladder blind: without a live spot price the
+  // fallback can land on an arbitrary far-out strike. Discovery retries in
+  // a few seconds, by which time the index proxy is ticking.
+  if (sessionMarkets.length > 1 && spotHint == null) {
+    throw new Error(`${seriesTicker}: waiting for index spot before picking an ATM strike`);
+  }
+
   const market = pickAtmMarket(sessionMarkets, spotHint);
   if (!market) throw new Error(`${seriesTicker}: no usable strike market in session`);
 
@@ -70,6 +77,7 @@ export async function discoverMarket(
     tickSize: 0.01,
     feeSchedule: KALSHI_FEE_RATE > 0 ? { rate: KALSHI_FEE_RATE, exponent: 1 } : null,
     settleWindowSec: SETTLE_WINDOW_SEC,
+    ladderSize: sessionMarkets.length,
   };
   return { info };
 }

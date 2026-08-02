@@ -52,6 +52,7 @@ interface InternalSession {
   discoveryError: string | null;
   discovering: boolean;
   lastDirection: string;
+  lastAtmCheck: number;
 }
 
 const emptyStatus = (): FeedStatus => ({
@@ -105,6 +106,7 @@ export class Engine {
           discoveryError: null,
           discovering: false,
           lastDirection: "NONE",
+          lastAtmCheck: 0,
         });
       }
     }
@@ -126,7 +128,14 @@ export class Engine {
       for (const session of this.sessions.values()) {
         const rolledOver = session.market !== null && now >= session.market.endTs + 1500;
         const missing = session.market === null && !session.discovering;
-        if (rolledOver || missing) void this.refreshSession(session);
+        // Strike ladders (hourly/daily) re-center on the ATM strike as the
+        // price moves, like Kalshi's own UI.
+        const recenter =
+          session.market !== null &&
+          session.market.ladderSize > 1 &&
+          now - session.lastAtmCheck > 45000;
+        if (recenter) session.lastAtmCheck = now;
+        if (rolledOver || missing || recenter) void this.refreshSession(session);
       }
     }, 3000);
     this.diagTimer = setInterval(() => {
@@ -232,7 +241,8 @@ export class Engine {
       if (isNew) {
         this.log(
           "info",
-          `${session.asset.toUpperCase()} ${session.horizon}: tracking ${info.ticker} (strike ${info.strike})`,
+          `${session.asset.toUpperCase()} ${session.horizon}: tracking ${info.ticker} ` +
+            `(strike ${info.strike}${info.ladderSize > 1 ? `, ladder of ${info.ladderSize}` : ""})`,
         );
         this.updateBookSubscriptions();
       }

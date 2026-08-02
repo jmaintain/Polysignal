@@ -45,6 +45,7 @@ async function main() {
     tickSize: 0.01,
     feeSchedule: { rate: 0.07, exponent: 1 },
     settleWindowSec: SETTLE_WINDOW_SEC,
+    ladderSize: 1,
   };
 
   await new Promise((r) => setTimeout(r, 300));

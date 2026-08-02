@@ -72,6 +72,8 @@ export interface MarketInfo {
   feeSchedule: { rate: number; exponent: number } | null;
   /** Seconds of the settlement averaging window (CF Benchmarks: 60). */
   settleWindowSec: number;
+  /** Number of strike markets in this session (1 = single up/down market). */
+  ladderSize: number;
 }
 
 export type StrikeSource = "kalshi_api" | "unknown";
