@@ -30,6 +30,7 @@ import {
   ASSET_IDS,
   HORIZONS,
   HORIZON_IDS,
+  INDEX_UNCERTAINTY,
   TICK_BUFFER_MS,
   VOL_HALF_LIVES,
 } from "../config.js";
@@ -352,7 +353,15 @@ export class Engine {
         settle?.avgSoFar != null
           ? { avgSoFar: settle.avgSoFar, elapsedSec: settle.elapsedSec }
           : null;
-      const pAbove = probAvgAbove(spot, market.strike, sigma, tau, market.settleWindowSec, partial);
+      const pAbove = probAvgAbove(
+        spot,
+        market.strike,
+        sigma,
+        tau,
+        market.settleWindowSec,
+        partial,
+        INDEX_UNCERTAINTY,
+      );
       p = market.strikeType === "less" ? 1 - pAbove : pAbove;
     }
 

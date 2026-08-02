@@ -142,6 +142,47 @@ describe("probAvgAbove (60s-average settlement, CF Benchmarks rule)", () => {
     expect(probAvgAbove(101000, 100000, sigma, 0, 60, { avgSoFar: 99990, elapsedSec: 60 })).toBe(0);
   });
 
+  it("index uncertainty prevents false certainty near the money", () => {
+    // The real settlement from validate:settle — official 63427.35 against
+    // strike 63431.24, a $3.89 margin, while our proxy tracks the official
+    // index to ~0.8bp ($5 on $63k). Treating our price as exact reports
+    // ~99% certainty on a call the data genuinely cannot resolve.
+    const partial = { avgSoFar: 63435, elapsedSec: 55 };
+    const asExact = probAvgAbove(63431, 63431.24, sigma, 5, 60, partial);
+    const honest = probAvgAbove(63431, 63431.24, sigma, 5, 60, partial, 0.0001);
+    expect(asExact).toBeGreaterThan(0.99);
+    expect(honest).toBeLessThan(0.8);
+    expect(honest).toBeGreaterThan(0.55);
+  });
+
+  it("index uncertainty still allows certainty when the margin is wide", () => {
+    const p = probAvgAbove(
+      63800,
+      63431.24,
+      sigma,
+      5,
+      60,
+      { avgSoFar: 63790, elapsedSec: 55 },
+      0.0001,
+    );
+    expect(p).toBeGreaterThan(0.999);
+  });
+
+  it("uncertainty widens the distribution outside the window too", () => {
+    const tight = probAvgAbove(100050, 100000, sigma, 300, 60);
+    const wide = probAvgAbove(100050, 100000, sigma, 300, 60, null, 0.0005);
+    // Both favor UP, but uncertainty pulls the estimate toward 50/50.
+    expect(tight).toBeGreaterThan(0.5);
+    expect(wide).toBeLessThan(tight);
+    expect(wide).toBeGreaterThan(0.5);
+  });
+
+  it("zero uncertainty reproduces the exact prior behavior", () => {
+    const a = probAvgAbove(100050, 100000, sigma, 300, 60, null, 0);
+    const b = probAvgAbove(100050, 100000, sigma, 300, 60);
+    expect(a).toBe(b);
+  });
+
   it("falls back to point pricing when the window is zero", () => {
     expect(probAvgAbove(100050, 100000, sigma, 300, 0)).toBeCloseTo(
       probUp(100050, 100000, sigma, 300),

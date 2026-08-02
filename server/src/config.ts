@@ -89,6 +89,16 @@ export function seriesFor(asset: AssetId, horizon: HorizonId): string[] {
 /** CF Benchmarks settlement rule: average of the final 60 seconds. */
 export const SETTLE_WINDOW_SEC = 60;
 
+/**
+ * Fractional uncertainty of our RTI proxy versus the official index.
+ * Measured live at 0.8bp against a published Kalshi settlement
+ * (`npm run validate:settle`); 1.5bp is a deliberately conservative
+ * default because near-the-money settlements are decided by margins of
+ * exactly this size. Set INDEX_UNCERTAINTY_BPS=0 to price the proxy as
+ * exact (not recommended).
+ */
+export const INDEX_UNCERTAINTY = Number(process.env.INDEX_UNCERTAINTY_BPS ?? "1.5") / 10000;
+
 /** Kalshi taker fee: fee = rate * p * (1-p) per contract. */
 export const KALSHI_FEE_RATE = Number(process.env.KALSHI_FEE_RATE ?? "0.07");
 

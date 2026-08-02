@@ -194,30 +194,53 @@ export function probAvgAbove(
   tauSec: number,
   avgWindowSec = 60,
   partial: PartialAverage | null = null,
+  /**
+   * Fractional uncertainty of our index level versus the official index
+   * (e.g. 0.0001 = 1 bp). Our price feed is a proxy for CF Benchmarks' RTI,
+   * and near the money that measurement error is a real part of the
+   * outcome distribution — without it the model reports false certainty on
+   * exactly the settlements that are too close to call.
+   */
+  indexUncertainty = 0,
 ): number {
   if (!(spot > 0) || !(strike > 0)) return NaN;
   const w = avgWindowSec;
   if (!(w > 0)) return probUp(spot, strike, sigmaSqrtSec, tauSec);
 
+  // Independent measurement variance, expressed as an addition to the
+  // diffusion variance over the effective horizon.
+  const inflate = (sigma: number, tauEff: number) =>
+    indexUncertainty > 0 && tauEff > 0
+      ? Math.sqrt(sigma * sigma + (indexUncertainty * indexUncertainty) / tauEff)
+      : sigma;
+
   if (tauSec >= w) {
     const tauEff = (tauSec - w) + w / 3;
-    return probUp(spot, strike, sigmaSqrtSec, tauEff);
+    return probUp(spot, strike, inflate(sigmaSqrtSec, tauEff), tauEff);
   }
 
+  // Inside the window, work in price space: over <= 60s the moves are far
+  // too small for the lognormal/normal distinction to matter, and this
+  // makes both uncertainty terms explicit.
+  //
+  //   X = (elapsed * avgObserved + futureSec * avgFuture) / w
+  //
+  // Var(X) has two independent parts: diffusion in the unobserved tail
+  // (weighted by its share of the window), and our index's measurement
+  // error against the official one, which applies to the level itself.
   const tau = Math.max(tauSec, 0);
   const elapsed = Math.min(Math.max(partial?.elapsedSec ?? w - tau, 0), w);
-  // Without observed data, the best estimate of the observed leg is spot.
   const avgObs = partial?.avgSoFar ?? spot;
+  const futureSec = Math.max(w - elapsed, 0);
 
-  if (tau <= 0.001) {
-    return avgObs > strike ? 1 : avgObs < strike ? 0 : 0.5;
-  }
+  const meanX = (elapsed * avgObs + futureSec * spot) / w;
+  const futureWeight = futureSec / w;
+  const sdDiffusion = futureWeight * spot * sigmaSqrtSec * Math.sqrt(futureSec / 3);
+  const sdIndex = indexUncertainty * meanX;
+  const sd = Math.sqrt(sdDiffusion * sdDiffusion + sdIndex * sdIndex);
 
-  // The future leg carries weight (w - elapsed) of the window average.
-  const futureSec = Math.max(w - elapsed, 0.001);
-  const kAdj = (w * strike - elapsed * avgObs) / futureSec;
-  if (kAdj <= 0) return 1; // average already banked above the strike
-  return probUp(spot, kAdj, sigmaSqrtSec, futureSec / 3);
+  if (!(sd > 0)) return meanX > strike ? 1 : meanX < strike ? 0 : 0.5;
+  return normCdf((meanX - strike) / sd);
 }
 
 /**

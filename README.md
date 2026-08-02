@@ -25,13 +25,28 @@ npm run dev        # server on :8788, dashboard on http://localhost:5173
 
 Monitor-only works with zero configuration (public REST market data). For sub-second full-depth order books and the trading panel, create a free API key on Kalshi (Settings → API keys), save the RSA private key it gives you, and fill in `.env` (see `.env.example`).
 
+## Validated (live, 2026-08-02)
+
+`npm run validate:settle` against a real expiring market — **24 passed, 0 failed**:
+
+| Check | Result |
+| --- | --- |
+| Our 60s average vs CF Benchmarks' published settlement | 63,422.49 vs **63,427.35** — **0.8 bp error** |
+| Settlement side called | NO — matched Kalshi's actual result |
+| Strike accuracy (all horizons) | within 0.01–0.09% of spot |
+| YES/NO book identities | exact on all 6 markets |
+| Vol scale 1s/5s/15s | ratios 0.72–0.87 — no microstructure-noise inflation |
+
+**Read the margin, not just the pass.** That settlement missed the strike by $3.89 while our proxy error was $4.86 — larger than the margin itself. We called it correctly because the error pointed the same way as the outcome, not because the data could resolve it. Since 15-minute markets set the strike at the session's opening price, they sit near the money by construction, so this is the normal case rather than an edge case. The model therefore treats the index level as uncertain (`INDEX_UNCERTAINTY_BPS`, default 1.5) and reports honest probabilities instead of false certainty on settlements too close to call.
+
 ## Validation
 
 ```bash
-npm run probe                 # dump live Kalshi series/market/orderbook facts
-npm run validate              # ~40s: feeds, discovery, book identities
-npm run validate -- --settle  # + waits for a real 15m expiry and checks our
-                              #   60s average against the actual settlement
+npm run probe            # dump live Kalshi series/market/orderbook facts
+npm run validate         # ~40s: feeds, discovery, book identities
+npm run validate:settle  # + waits for a real 15m expiry, grades our 60s
+                         #   average against CF Benchmarks' published
+                         #   settlement in bps, and checks vol sampling
 ```
 
 Offline plumbing test (no network): `npm exec -w server tsx src/smoke.ts`.
@@ -59,6 +74,6 @@ web/ (React+Vite) — matrix, focus panel (expert + simple), chart, trading
 
 ## Honest limitations
 
-- The index proxy tracks CF Benchmarks closely but is not the licensed feed; near-strike settlements within the proxy's error band (typically a few basis points) are genuinely uncertain — the dashboard's edge math treats the strike as exact, so don't trade the last cent of a coin-flip settlement.
+- The index proxy tracks CF Benchmarks to ~1bp but is not the licensed feed. That error is now priced into the model rather than ignored, but it does not disappear: on a settlement decided by a few dollars, the honest answer is a coin flip, and the tool will say so instead of showing 99%. One validated settlement is not a track record — run `validate:settle` across several hours before trusting it with money.
 - Series auto-discovery classifies Kalshi series by close-time cadence; if Kalshi restructures a series, pin it via `KALSHI_SERIES_*` env vars (`npm run probe` shows what's live).
 - The fair-value model is driftless GBM with EWMA vol — a strong baseline, not an oracle. Signals are information, not financial advice.
