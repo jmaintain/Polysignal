@@ -71,15 +71,19 @@ export const HORIZON_IDS = Object.keys(HORIZONS) as HorizonId[];
  * legacy above/below series. SOL has no daily series on Kalshi today.
  * KALSHI_SERIES_<ASSET>_<HORIZON> env vars override.
  */
-export const SERIES_DEFAULTS: Record<AssetId, Record<HorizonId, string | null>> = {
-  btc: { "15m": "KXBTC15M", "1h": "KXBTCD", "1d": "BTCD" },
-  eth: { "15m": "KXETH15M", "1h": "KXETHD", "1d": "ETHD" },
-  sol: { "15m": "KXSOL15M", "1h": "KXSOLD", "1d": null },
+export const SERIES_DEFAULTS: Record<AssetId, Record<HorizonId, string[]>> = {
+  btc: { "15m": ["KXBTC15M"], "1h": ["KXBTCD"], "1d": ["BTCD", "BTCD-B"] },
+  eth: { "15m": ["KXETH15M"], "1h": ["KXETHD"], "1d": ["ETHD"] },
+  // Kalshi lists no SOL daily above/below series today.
+  sol: { "15m": ["KXSOL15M"], "1h": ["KXSOLD"], "1d": [] },
 };
 
-export function seriesFor(asset: AssetId, horizon: HorizonId): string | null {
+/** Candidate series for an asset/horizon, most likely first. */
+export function seriesFor(asset: AssetId, horizon: HorizonId): string[] {
   const key = `KALSHI_SERIES_${asset.toUpperCase()}_${horizon.toUpperCase()}`;
-  return process.env[key] || SERIES_DEFAULTS[asset][horizon];
+  const override = process.env[key];
+  if (override) return override.split(",").map((s) => s.trim()).filter(Boolean);
+  return SERIES_DEFAULTS[asset][horizon];
 }
 
 /** CF Benchmarks settlement rule: average of the final 60 seconds. */

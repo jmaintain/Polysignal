@@ -34,7 +34,7 @@ import {
   VOL_HALF_LIVES,
 } from "../config.js";
 import { KalshiBooksFeed } from "../feeds/kalshiBooks.js";
-import { discoverMarket } from "./discovery.js";
+import { discoverMarket, isNotListed } from "./discovery.js";
 import type { KalshiApi, KalshiCredentials } from "./kalshiApi.js";
 
 interface AssetState {
@@ -53,6 +53,10 @@ interface InternalSession {
   discovering: boolean;
   lastDirection: string;
   lastAtmCheck: number;
+  /** Backoff gate so a missing series doesn't hammer the API. */
+  nextRetryAt: number;
+  retryDelayMs: number;
+  notListed: boolean;
 }
 
 const emptyStatus = (): FeedStatus => ({
@@ -107,6 +111,9 @@ export class Engine {
           discovering: false,
           lastDirection: "NONE",
           lastAtmCheck: 0,
+          nextRetryAt: 0,
+          retryDelayMs: 0,
+          notListed: false,
         });
       }
     }
@@ -126,8 +133,9 @@ export class Engine {
     this.discoveryTimer = setInterval(() => {
       const now = Date.now();
       for (const session of this.sessions.values()) {
+        if (session.discovering || now < session.nextRetryAt) continue;
         const rolledOver = session.market !== null && now >= session.market.endTs + 1500;
-        const missing = session.market === null && !session.discovering;
+        const missing = session.market === null;
         // Strike ladders (hourly/daily) re-center on the ATM strike as the
         // price moves, like Kalshi's own UI.
         const recenter =
@@ -227,27 +235,51 @@ export class Engine {
     session.discovering = true;
     try {
       const spot = this.assets.get(session.asset)!.latest.index?.price ?? null;
+      const now = Date.now();
+      // Same session still running? Use the cheap per-event lookup.
+      const preferEventTicker =
+        session.market && now < session.market.endTs ? session.market.eventTicker : null;
       const { info } = await discoverMarket(
         this.api,
         session.asset,
         session.horizon,
-        Date.now(),
+        now,
         spot,
-        (m) => this.log("info", m),
+        { preferEventTicker, log: (m) => this.log("info", m) },
       );
       const isNew = session.market?.ticker !== info.ticker;
+      const sameSession = session.market?.eventTicker === info.eventTicker;
       session.market = info;
       session.discoveryError = null;
+      session.notListed = false;
+      session.retryDelayMs = 0;
+      session.nextRetryAt = 0;
       if (isNew) {
         this.log(
           "info",
-          `${session.asset.toUpperCase()} ${session.horizon}: tracking ${info.ticker} ` +
-            `(strike ${info.strike}${info.ladderSize > 1 ? `, ladder of ${info.ladderSize}` : ""})`,
+          `${session.asset.toUpperCase()} ${session.horizon}: ${sameSession ? "re-centered on" : "tracking"} ` +
+            `${info.ticker} (strike ${info.strike}${info.ladderSize > 1 ? `, ladder of ${info.ladderSize}` : ""})`,
         );
         this.updateBookSubscriptions();
       }
     } catch (err) {
-      session.discoveryError = (err as Error).message;
+      const notListed = isNotListed(err);
+      const message = (err as Error).message;
+      // Back off on failure: 15s, 30s, … capped at 5min, so a series the
+      // exchange isn't listing right now costs one call every few minutes.
+      session.retryDelayMs = Math.min(
+        session.retryDelayMs > 0 ? session.retryDelayMs * 2 : 15000,
+        300000,
+      );
+      session.nextRetryAt = Date.now() + session.retryDelayMs;
+      if (!session.notListed || !notListed) {
+        this.log(
+          notListed ? "info" : "warn",
+          `${session.asset.toUpperCase()} ${session.horizon}: ${message} (retrying in ${Math.round(session.retryDelayMs / 1000)}s)`,
+        );
+      }
+      session.notListed = notListed;
+      session.discoveryError = notListed ? `not listed right now — ${message}` : message;
       if (session.market && Date.now() >= session.market.endTs) {
         session.market = null;
         this.updateBookSubscriptions();

@@ -21,7 +21,7 @@ import "dotenv/config";
 import type { AssetId, PriceTick } from "@polysignal/shared";
 import { ASSET_IDS, HORIZON_IDS, HORIZONS } from "./config.js";
 import { IndexProxyService } from "./services/indexProxy.js";
-import { discoverMarket } from "./services/discovery.js";
+import { discoverMarket, isNotListed } from "./services/discovery.js";
 import { KalshiApi, loadCredentials, topOfBook } from "./services/kalshiApi.js";
 
 interface CheckResult {
@@ -102,19 +102,28 @@ async function main() {
     const spot = index[asset][index[asset].length - 1]?.price ?? null;
     for (const horizon of HORIZON_IDS) {
       try {
-        const { info } = await discoverMarket(api, asset, horizon, now, spot, () => {});
+        const { info } = await discoverMarket(api, asset, horizon, now, spot);
         const secsLeft = (info.endTs - now) / 1000;
         const okWindow = secsLeft > 0 && secsLeft <= HORIZONS[horizon].seconds + 3600;
-        const strikeSane =
-          spot == null || (info.strike > spot * 0.5 && info.strike < spot * 2);
+        // The tracked strike must be the at-the-money rung. A truncated
+        // ladder shows up here as a strike far from spot.
+        const drift = spot != null ? Math.abs(info.strike - spot) / spot : 0;
+        const atmOk = spot == null || drift <= (horizon === "1d" ? 0.05 : 0.01);
         record(
           `${asset.toUpperCase()} ${horizon} market`,
-          okWindow && strikeSane,
-          `${info.ticker} strike ${info.strike} ends in ${Math.round(secsLeft)}s`,
+          okWindow && atmOk,
+          `${info.ticker} strike ${info.strike} (${(drift * 100).toFixed(2)}% from spot` +
+            `${info.ladderSize > 1 ? `, ladder of ${info.ladderSize}` : ""}) ends in ${Math.round(secsLeft)}s`,
         );
         found.push({ asset, horizon, ticker: info.ticker, strike: info.strike, endTs: info.endTs });
       } catch (err) {
-        record(`${asset.toUpperCase()} ${horizon} market`, false, (err as Error).message);
+        // A series the exchange simply isn't listing right now is not a
+        // defect in this tool — report it, don't fail the run.
+        record(
+          `${asset.toUpperCase()} ${horizon} market`,
+          isNotListed(err) ? null : false,
+          (err as Error).message,
+        );
       }
     }
   }
@@ -130,7 +139,12 @@ async function main() {
       for (const m of body.markets ?? []) {
         const tob = topOfBook(m);
         if (tob.yesBid == null || tob.yesAsk == null || tob.noBid == null) {
-          record(`book ${m.ticker}`, false, `missing top-of-book (${JSON.stringify(tob)})`);
+          record(
+            `book ${m.ticker}`,
+            false,
+            `one-sided book — nobody is quoting this strike ` +
+              `(yes_bid ${tob.yesBid}, yes_ask ${tob.yesAsk}); usually means a non-ATM strike was picked`,
+          );
           continue;
         }
         const identity = Math.abs(tob.yesAsk - (1 - tob.noBid));

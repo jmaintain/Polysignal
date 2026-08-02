@@ -31,6 +31,8 @@ export interface KalshiEvent {
   event_ticker: string;
   series_ticker?: string;
   title?: string;
+  /** Present when requested with with_nested_markets. */
+  markets?: KalshiMarket[];
   [key: string]: unknown;
 }
 
@@ -240,6 +242,7 @@ export class KalshiApi {
     series_ticker?: string;
     limit?: number;
     cursor?: string;
+    with_nested_markets?: string;
   }): Promise<{ events: KalshiEvent[]; cursor?: string }> {
     return this.request("GET", "/events", { query });
   }
