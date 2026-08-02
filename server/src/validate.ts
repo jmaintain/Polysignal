@@ -43,8 +43,39 @@ const median = (xs: number[]) => {
   return s.length ? s[Math.floor(s.length / 2)] : NaN;
 };
 
+/**
+ * Realized volatility (per sqrt-second) from ticks resampled onto a grid.
+ * Comparing across sampling intervals is the standard signature test for
+ * microstructure noise: if sigma at 1s far exceeds sigma at 15s, the
+ * short-interval estimate is measuring venue jitter, not price movement —
+ * and an inflated sigma drags every model probability toward 50 cents.
+ */
+function realizedVol(ticks: PriceTick[], sampleSec: number): number {
+  if (ticks.length < 3) return NaN;
+  const sampled: number[] = [];
+  let nextTs = ticks[0].ts;
+  for (const t of ticks) {
+    if (t.ts >= nextTs) {
+      sampled.push(t.price);
+      nextTs = t.ts + sampleSec * 1000;
+    }
+  }
+  if (sampled.length < 4) return NaN;
+  const rets = sampled.slice(1).map((p, i) => Math.log(p / sampled[i]));
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const varr = rets.reduce((s, r) => s + (r - mean) ** 2, 0) / (rets.length - 1);
+  return Math.sqrt(varr / sampleSec);
+}
+
+const annualize = (sigmaPerSqrtSec: number) => sigmaPerSqrtSec * Math.sqrt(365 * 24 * 3600);
+
 async function main() {
-  const settleMode = process.argv.includes("--settle");
+  // Accept the flag or an env var — npm can swallow forwarded args.
+  const settleMode =
+    process.argv.includes("--settle") ||
+    process.env.SETTLE === "1" ||
+    process.env.SETTLE === "true" ||
+    process.env.npm_config_settle === "true";
   console.log("Polysignal live validation (Kalshi / CF Benchmarks)");
   console.log("===================================================\n");
 
@@ -244,6 +275,28 @@ async function main() {
           }
         }
       }
+    }
+  }
+
+  if (settleMode) {
+    console.log("\nPhase 5: volatility scale (microstructure-noise check)");
+    for (const asset of ASSET_IDS) {
+      const ticks = index[asset];
+      const s1 = realizedVol(ticks, 1);
+      const s5 = realizedVol(ticks, 5);
+      const s15 = realizedVol(ticks, 15);
+      if (!Number.isFinite(s15) || !Number.isFinite(s1)) {
+        record(`${asset.toUpperCase()} vol scale`, null, "not enough ticks");
+        continue;
+      }
+      const ratio = s1 / s15;
+      record(
+        `${asset.toUpperCase()} vol scale`,
+        ratio < 1.5,
+        `ann. vol 1s ${(annualize(s1) * 100).toFixed(0)}% / 5s ${(annualize(s5) * 100).toFixed(0)}% / ` +
+          `15s ${(annualize(s15) * 100).toFixed(0)}% (1s/15s ratio ${ratio.toFixed(2)}` +
+          `${ratio >= 1.5 ? " — 1s sampling is inflated by venue jitter" : ""})`,
+      );
     }
   }
 
